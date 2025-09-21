@@ -253,10 +253,10 @@ def create_mode_summary(file_path):
             }
             total_duration += duration_sum
         
-        # 计算百分比（Duration ÷ 90）
+        # 计算百分比（Duration ÷ 90 × 100）
         for mode in mode_stats:
             duration_minutes = mode_stats[mode]['duration_minutes']
-            percentage = duration_minutes / 90 if duration_minutes > 0 else 0
+            percentage = (duration_minutes / 90) * 100 if duration_minutes > 0 else 0
             mode_stats[mode]['percentage'] = percentage
         
         # 创建汇总表格
@@ -278,8 +278,9 @@ def create_mode_summary(file_path):
             
             summary_data.append([
                 mode, range_start, range_end, stats['count'],
-                round(stats['duration_minutes'], 2),
-                f"{stats['percentage']:.2f}", color,  # 不加%符号，显示小数
+                stats['duration_minutes'],  # 保持原精度，不四舍五入
+                f"{stats['percentage']:.2f}%",  # 百分比保留两位小数并加%符号
+                color,
                 f"Mode {mode} ({range_start}-{range_end})",
                 '', '', '', '', ''
             ])
@@ -380,7 +381,7 @@ def main():
                                 stats = mode_stats[mode]
                                 range_start = (mode - 1) * 20000
                                 range_end = mode * 20000
-                                print(f"Mode {mode:2d} ({range_start:6d}-{range_end:6d}): {stats['count']:3d} 条, {stats['duration_minutes']:6.2f}分钟, {stats['percentage']:6.2f}")
+                                print(f"Mode {mode:2d} ({range_start:6d}-{range_end:6d}): {stats['count']:3d} 条, {stats['duration_minutes']:.10f}分钟, {stats['percentage']:.2f}%")
                             
                             print(f"总计: {total_records} 条记录, {total_duration:.2f} 分钟")
                             
