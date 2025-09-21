@@ -7,10 +7,3 @@ __pycache__/
 # Project directories to ignore
 PRproject/
 眼动数据/
-
-# Ignore all files except specific ones
-*
-!.gitignore
-!*.py
-!excelFile/
-!excelFile/**
