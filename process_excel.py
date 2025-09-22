@@ -205,6 +205,76 @@ def save_processed_file(df, original_path):
         print(f"❌ 保存文件时出错: {e}")
         return False
 
+def remove_blank_rows(file_path):
+    """移除E列为空或为0的行"""
+    try:
+        print(f"📖 正在读取文件: {os.path.basename(file_path)}")
+        
+        # 尝试不同的编码和分隔符
+        encodings = ['utf-16', 'utf-16le', 'utf-16be', 'utf-8-sig', 'utf-8', 'gbk', 'gb2312', 'cp1252', 'latin1']
+        df = None
+        
+        for encoding in encodings:
+            for sep in ['\t', ',']:
+                try:
+                    df = pd.read_csv(file_path, encoding=encoding, sep=sep)
+                    if len(df.columns) >= 5:
+                        print(f"✅ 使用编码 {encoding}, 分隔符 '{sep}' 成功读取文件")
+                        break
+                    else:
+                        df = None
+                except:
+                    continue
+            if df is not None:
+                break
+        
+        if df is None:
+            print("❌ 无法读取文件，请检查文件格式")
+            return None
+        
+        print(f"📊 原始文件包含 {len(df)} 行数据")
+        
+        # 获取列名
+        columns = list(df.columns)
+        if len(columns) < 5:
+            print("❌ 列数不足")
+            return None
+        
+        e_col = columns[4]  # E列（持续时间）
+        print(f"🎯 检查E列: {e_col}")
+        
+        # 统计空白行
+        original_count = len(df)
+        
+        # 移除E列为空、0或NaN的行
+        # 保留标题行（第一行）和有效数据行
+        mask = (df.index == 0) | (
+            (pd.notna(df[e_col])) & 
+            (df[e_col] != 0) & 
+            (df[e_col] != '') & 
+            (df[e_col].astype(str).str.strip() != '')
+        )
+        
+        cleaned_df = df[mask].copy()
+        cleaned_count = len(cleaned_df)
+        removed_count = original_count - cleaned_count
+        
+        print(f"📊 处理结果:")
+        print(f"   原始行数: {original_count}")
+        print(f"   保留行数: {cleaned_count}")
+        print(f"   移除行数: {removed_count}")
+        
+        if removed_count > 0:
+            print(f"✅ 成功移除 {removed_count} 个空白行")
+        else:
+            print(f"ℹ️  没有找到需要移除的空白行")
+        
+        return cleaned_df
+        
+    except Exception as e:
+        print(f"❌ 移除空白行时出错: {e}")
+        return None
+
 def create_mode_summary(file_path):
     """创建Mode汇总表格"""
     try:
@@ -354,10 +424,13 @@ def main():
                 print(f"\n选择处理模式:")
                 print(f"1. 详细模式 - 生成包含所有数据行的完整文件")
                 print(f"2. 汇总模式 - 生成13行Mode汇总表格 (推荐)")
+                print(f"3. 移除空白行 - 删除E列为空或为0的行")
                 
-                mode_choice = input(f"\n请选择模式 (1/2, 默认2): ").strip()
+                mode_choice = input(f"\n请选择模式 (1/2/3, 默认2): ").strip()
                 if mode_choice == '1':
                     process_mode = 'detailed'
+                elif mode_choice == '3':
+                    process_mode = 'remove_blank'
                 else:
                     process_mode = 'summary'
                 
@@ -393,6 +466,21 @@ def main():
                             summary_df.to_csv(summary_file_path, index=False, encoding='utf-8-sig')
                             print(f"\n✅ 汇总文件保存成功!")
                             print(f"📁 保存位置: {summary_file_path}")
+                            success = True
+                        else:
+                            success = False
+                    elif process_mode == 'remove_blank':
+                        # 移除空白行模式
+                        cleaned_df = remove_blank_rows(selected_file)
+                        if cleaned_df is not None:
+                            # 保存清理后的文件
+                            base_name = os.path.splitext(os.path.basename(selected_file))[0]
+                            dir_name = os.path.dirname(selected_file)
+                            cleaned_file_path = os.path.join(dir_name, f"{base_name}_cleaned.csv")
+                            
+                            cleaned_df.to_csv(cleaned_file_path, index=False, encoding='utf-8-sig')
+                            print(f"\n✅ 清理后文件保存成功!")
+                            print(f"📁 保存位置: {cleaned_file_path}")
                             success = True
                         else:
                             success = False
