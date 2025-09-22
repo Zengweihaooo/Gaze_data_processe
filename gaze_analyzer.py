@@ -36,6 +36,10 @@ class GazeAnalyzer:
         self.state_start_frame = 0
         self.segments = []  # 存储所有片段
         
+        # 近处优先检测
+        self.last_gaze_position = None  # 上一帧的视线位置
+        self.proximity_radius = 128     # 近处搜索半径
+        
     def detect_gaze_circle(self, frame):
         """检测白色圆形视线点"""
         # 转换为灰度图
@@ -46,6 +50,16 @@ class GazeAnalyzer:
         top_exclude = int(h * 0.05)      # 顶部5%
         left_exclude = int(w * 0.23)     # 左侧10%
         right_exclude = w - int(w * 0.23) # 右侧10%
+        
+        # 创建黑色区域mask
+        black_mask = self.create_black_region_mask(gray)
+        
+        # 近处优先检测：如果有上一帧的位置，优先在附近搜索
+        if self.last_gaze_position is not None:
+            proximity_circle = self.detect_with_proximity_priority(gray, left_exclude, right_exclude, top_exclude)
+            if proximity_circle:
+                self.last_gaze_position = (proximity_circle[0], proximity_circle[1])
+                return proximity_circle, black_mask
         
         # 先尝试标准参数检测
         circles = cv2.HoughCircles(
@@ -59,7 +73,13 @@ class GazeAnalyzer:
             maxRadius=12 # 减小50%: 25->12
         )
         
-        # 如果标准参数没检测到，且图像较暗（可能是黑色背景），使用更敏感的参数
+        # 优先在黑色区域内用高敏感度检测
+        black_region_circle = self.detect_in_black_region(gray, black_mask, left_exclude, right_exclude, top_exclude)
+        if black_region_circle:
+            self.last_gaze_position = (black_region_circle[0], black_region_circle[1])
+            return black_region_circle, black_mask
+        
+        # 如果黑色区域没检测到，使用标准参数在全图检测
         if circles is None:
             avg_brightness = np.mean(gray)
             if avg_brightness < 80:  # 判断为暗背景
@@ -86,6 +106,10 @@ class GazeAnalyzer:
                 if (left_exclude <= x <= right_exclude and 
                     y >= top_exclude and 
                     0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]):
+                    # 检查是否是方向盘按钮（白色边界+黑色内部）
+                    if self.is_steering_wheel_button(gray, x, y, r):
+                        continue  # 跳过方向盘按钮
+                    
                     # 检查圆心周围的亮度 - 增强黑色区域识别能力
                     roi = gray[max(0, y-r):min(gray.shape[0], y+r),
                               max(0, x-r):min(gray.shape[1], x+r)]
@@ -110,6 +134,193 @@ class GazeAnalyzer:
                                 
                             if score > max_brightness:
                                 max_brightness = score
+                                best_circle = (x, y, r)
+            
+            # 更新最后检测到的位置
+            if best_circle is not None:
+                self.last_gaze_position = (best_circle[0], best_circle[1])
+            
+            return best_circle, black_mask
+        
+        return None, black_mask
+    
+    def is_steering_wheel_button(self, gray, x, y, r):
+        """检测是否是方向盘按钮（白色边界+黑色内部）"""
+        # 检查圆心区域
+        center_r = max(1, int(r * 0.6))  # 内部区域半径
+        center_roi = gray[max(0, y-center_r):min(gray.shape[0], y+center_r),
+                         max(0, x-center_r):min(gray.shape[1], x+center_r)]
+        
+        # 检查边界区域
+        edge_r = r
+        edge_roi = gray[max(0, y-edge_r):min(gray.shape[0], y+edge_r),
+                       max(0, x-edge_r):min(gray.shape[1], x+edge_r)]
+        
+        if center_roi.size == 0 or edge_roi.size == 0:
+            return False
+        
+        center_brightness = np.mean(center_roi)
+        edge_brightness = np.mean(edge_roi)
+        
+        # 方向盘特征：边界亮（白色），中心暗（黑色按钮）
+        # 真实视线点特征：整体都是白色，中心也很亮
+        is_steering_wheel = (
+            edge_brightness > 120 and          # 边界较亮（白色边界）
+            center_brightness < 80 and         # 中心较暗（黑色按钮）
+            (edge_brightness - center_brightness) > 60  # 边界与中心对比度高
+        )
+        
+        return is_steering_wheel
+    
+    def detect_with_proximity_priority(self, gray, left_exclude, right_exclude, top_exclude):
+        """近处优先检测：在上一帧位置周围逐步扩大搜索范围"""
+        if self.last_gaze_position is None:
+            return None
+            
+        last_x, last_y = self.last_gaze_position
+        h, w = gray.shape
+        
+        # 逐步扩大搜索半径：128, 256, 384...
+        for search_radius in [128, 256, 384]:
+            # 定义搜索区域
+            search_x1 = max(left_exclude, last_x - search_radius)
+            search_y1 = max(top_exclude, last_y - search_radius)
+            search_x2 = min(right_exclude, last_x + search_radius)
+            search_y2 = min(h, last_y + search_radius)
+            
+            # 如果搜索区域太小，跳过
+            if search_x2 - search_x1 < 50 or search_y2 - search_y1 < 50:
+                continue
+            
+            # 在搜索区域内检测圆形
+            search_roi = gray[search_y1:search_y2, search_x1:search_x2]
+            
+            # 使用高敏感度参数在近处搜索
+            circles = cv2.HoughCircles(
+                search_roi,
+                cv2.HOUGH_GRADIENT,
+                dp=1,
+                minDist=20,
+                param1=35,   # 降低阈值提高敏感度
+                param2=25,   # 降低累加器阈值
+                minRadius=3,
+                maxRadius=12
+            )
+            
+            if circles is not None:
+                circles = np.round(circles[0, :]).astype("int")
+                
+                # 找到距离上一帧位置最近的圆
+                best_circle = None
+                min_distance = float('inf')
+                
+                for (rel_x, rel_y, r) in circles:
+                    # 转换为全图坐标
+                    abs_x = rel_x + search_x1
+                    abs_y = rel_y + search_y1
+                    
+                    # 检查是否在有效区域
+                    if not (left_exclude <= abs_x <= right_exclude and abs_y >= top_exclude):
+                        continue
+                    
+                    # 检查是否是方向盘按钮
+                    if self.is_steering_wheel_button(gray, abs_x, abs_y, r):
+                        continue
+                    
+                    # 计算距离上一帧的距离
+                    distance = ((abs_x - last_x) ** 2 + (abs_y - last_y) ** 2) ** 0.5
+                    
+                    # 验证圆的质量
+                    roi = gray[max(0, abs_y-r):min(h, abs_y+r),
+                             max(0, abs_x-r):min(w, abs_x+r)]
+                    if roi.size > 0:
+                        brightness = np.mean(roi)
+                        # 基本亮度要求
+                        if brightness > 100 and distance < min_distance:
+                            min_distance = distance
+                            best_circle = (abs_x, abs_y, r)
+                
+                if best_circle is not None:
+                    return best_circle
+        
+        return None
+    
+    def create_black_region_mask(self, gray):
+        """创建黑色区域的mask"""
+        # 使用自适应阈值检测黑色区域
+        binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                      cv2.THRESH_BINARY_INV, 15, 10)
+        
+        # 形态学处理，连接黑色区域
+        kernel = np.ones((5,5), np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+        
+        # 找到最大的黑色区域
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            # 选择面积最大的轮廓
+            largest_contour = max(contours, key=cv2.contourArea)
+            mask = np.zeros_like(gray)
+            cv2.fillPoly(mask, [largest_contour], 255)
+            return mask
+        
+        return np.zeros_like(gray)
+    
+    def detect_in_black_region(self, gray, black_mask, left_exclude, right_exclude, top_exclude):
+        """在黑色区域内用高敏感度检测白圈"""
+        if black_mask is None:
+            return None
+        
+        # 在黑色区域内使用超高敏感度参数
+        circles = cv2.HoughCircles(
+            gray,
+            cv2.HOUGH_GRADIENT,
+            dp=1,
+            minDist=15,   # 更小的最小距离
+            param1=25,    # 更低的边缘检测阈值
+            param2=15,    # 更低的累加器阈值
+            minRadius=3,
+            maxRadius=12
+        )
+        
+        if circles is not None:
+            circles = np.round(circles[0, :]).astype("int")
+            
+            best_circle = None
+            max_score = 0
+            
+            for (x, y, r) in circles:
+                # 检查是否在有效区域
+                if not (left_exclude <= x <= right_exclude and y >= top_exclude):
+                    continue
+                
+                # 检查是否在黑色区域内
+                if black_mask[y, x] == 0:  # 不在黑色区域内
+                    continue
+                
+                # 检查是否是方向盘按钮
+                if self.is_steering_wheel_button(gray, x, y, r):
+                    continue
+                
+                # 计算在黑色区域内的评分
+                roi = gray[max(0, y-r):min(gray.shape[0], y+r),
+                          max(0, x-r):min(gray.shape[1], x+r)]
+                
+                if roi.size > 0:
+                    brightness = np.mean(roi)
+                    
+                    # 黑色区域内的白点应该有很高的亮度
+                    if brightness > 120:  # 在黑色背景中的白点
+                        # 计算与周围黑色区域的对比度
+                        surrounding_roi = gray[max(0, y-r*2):min(gray.shape[0], y+r*2),
+                                             max(0, x-r*2):min(gray.shape[1], x+r*2)]
+                        if surrounding_roi.size > 0:
+                            contrast = brightness - np.mean(surrounding_roi)
+                            score = brightness + contrast * 2  # 重视对比度
+                            
+                            if score > max_score:
+                                max_score = score
                                 best_circle = (x, y, r)
             
             return best_circle
@@ -172,6 +383,33 @@ class GazeAnalyzer:
         text_x = x + (w - text_size[0]) // 2
         text_y = y + (h + text_size[1]) // 2
         cv2.putText(frame, text, (text_x, text_y), font, 0.6, (255, 255, 255), 2)
+    
+    def draw_mask_indicator(self, frame, black_mask):
+        """在左下角显示黑色区域mask的缩略图"""
+        h, w = frame.shape[:2]
+        
+        # 缩略图大小
+        thumb_w, thumb_h = 120, 80
+        thumb_x = 20
+        thumb_y = h - thumb_h - 20
+        
+        # 缩放mask到缩略图大小
+        mask_resized = cv2.resize(black_mask, (thumb_w, thumb_h))
+        
+        # 创建彩色版本的mask (白色区域显示为绿色)
+        # 将mask转换为3通道，白色区域显示为绿色
+        mask_colored = np.zeros((thumb_h, thumb_w, 3), dtype=np.uint8)
+        mask_colored[:, :, 1] = mask_resized  # 绿色通道
+        
+        # 在原图上叠加缩略图
+        frame[thumb_y:thumb_y+thumb_h, thumb_x:thumb_x+thumb_w] = mask_colored
+        
+        # 绘制边框
+        cv2.rectangle(frame, (thumb_x, thumb_y), (thumb_x+thumb_w, thumb_y+thumb_h), (255, 255, 255), 2)
+        
+        # 添加标签
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(frame, 'Black Mask', (thumb_x, thumb_y-5), font, 0.4, (255, 255, 255), 1)
     
     def update_state(self, new_state, frame_num, fps):
         """更新状态并记录片段"""
@@ -249,9 +487,15 @@ class GazeAnalyzer:
                     break
                 
                 # 检测视线点
-                gaze_circle = self.detect_gaze_circle(frame)
+                detection_result = self.detect_gaze_circle(frame)
                 
                 current_state = 'unknown'
+                gaze_circle = None
+                black_mask = None
+                
+                if detection_result and len(detection_result) == 2:
+                    gaze_circle, black_mask = detection_result
+                
                 if gaze_circle:
                     gaze_x, gaze_y, radius = gaze_circle
                     
@@ -261,12 +505,20 @@ class GazeAnalyzer:
                     # 在视线点绘制圆圈（用于调试）
                     cv2.circle(frame, (gaze_x, gaze_y), radius, (255, 255, 0), 2)
                     cv2.circle(frame, (gaze_x, gaze_y), self.detection_radius, (0, 255, 255), 1)
+                else:
+                    # 反向逻辑：如果黑色区域内没有检测到白圈，判断为现实世界
+                    if black_mask is not None and np.sum(black_mask) > 1000:  # 确保有足够大的黑色区域
+                        current_state = 'reality'
                 
                 # 更新状态
                 self.update_state(current_state, frame_num, fps)
                 
                 # 绘制状态指示器
                 self.draw_indicator(frame, current_state)
+                
+                # 在左下角显示黑色区域mask
+                if black_mask is not None:
+                    self.draw_mask_indicator(frame, black_mask)
                 
                 # 显示进度
                 if frame_num % 100 == 0:
