@@ -41,6 +41,12 @@ class GazeAnalyzer:
         # 转换为灰度图
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
+        # 计算排除区域边界 - 排除顶部5%和左右两侧10%
+        h, w = gray.shape
+        top_exclude = int(h * 0.05)      # 顶部5%
+        left_exclude = int(w * 0.23)     # 左侧10%
+        right_exclude = w - int(w * 0.23) # 右侧10%
+        
         # 先尝试标准参数检测
         circles = cv2.HoughCircles(
             gray,
@@ -76,7 +82,10 @@ class GazeAnalyzer:
             max_brightness = 0
             
             for (x, y, r) in circles:
-                if 0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]:
+                # 检查是否在有效检测区域内（排除顶部5%和左右两侧10%）
+                if (left_exclude <= x <= right_exclude and 
+                    y >= top_exclude and 
+                    0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]):
                     # 检查圆心周围的亮度 - 增强黑色区域识别能力
                     roi = gray[max(0, y-r):min(gray.shape[0], y+r),
                               max(0, x-r):min(gray.shape[1], x+r)]
