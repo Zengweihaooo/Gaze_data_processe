@@ -40,6 +40,13 @@ class GazeAnalyzer:
         self.last_gaze_position = None  # 上一帧的视线位置
         self.proximity_radius = 128     # 近处搜索半径
         
+        # 圆形质量控制参数
+        self.min_circle_fill_ratio = 0.55
+        self.max_circle_std_ratio = 0.6
+        self.max_ring_intensity_gap = 25
+        self.min_perimeter_brightness_ratio = 0.7
+        self.max_color_std_for_circle = 35.0
+        
     def detect_gaze_circle(self, frame):
         """检测白色圆形视线点"""
         # 转换为灰度图
@@ -56,7 +63,7 @@ class GazeAnalyzer:
         
         # 近处优先检测：如果有上一帧的位置，优先在附近搜索
         if self.last_gaze_position is not None:
-            proximity_circle = self.detect_with_proximity_priority(gray, left_exclude, right_exclude, top_exclude)
+            proximity_circle = self.detect_with_proximity_priority(frame, gray, left_exclude, right_exclude, top_exclude)
             if proximity_circle:
                 self.last_gaze_position = (proximity_circle[0], proximity_circle[1])
                 return proximity_circle, black_mask
@@ -74,7 +81,7 @@ class GazeAnalyzer:
         )
         
         # 优先在黑色区域内用高敏感度检测
-        black_region_circle = self.detect_in_black_region(gray, black_mask, left_exclude, right_exclude, top_exclude)
+        black_region_circle = self.detect_in_black_region(frame, gray, black_mask, left_exclude, right_exclude, top_exclude)
         if black_region_circle:
             self.last_gaze_position = (black_region_circle[0], black_region_circle[1])
             return black_region_circle, black_mask
@@ -96,6 +103,7 @@ class GazeAnalyzer:
         
         if circles is not None:
             circles = np.round(circles[0, :]).astype("int")
+            frame_avg_brightness = float(np.mean(gray))
             
             # 找到最亮的圆（可能是视线点）
             best_circle = None
@@ -110,31 +118,23 @@ class GazeAnalyzer:
                     if self.is_steering_wheel_button(gray, x, y, r):
                         continue  # 跳过方向盘按钮
                     
-                    # 检查圆心周围的亮度 - 增强黑色区域识别能力
-                    roi = gray[max(0, y-r):min(gray.shape[0], y+r),
-                              max(0, x-r):min(gray.shape[1], x+r)]
-                    if roi.size > 0:
-                        brightness = np.mean(roi)
-                        # 增强对比度检测，优先选择与周围对比度高的圆
-                        surrounding_roi = gray[max(0, y-r*2):min(gray.shape[0], y+r*2),
-                                             max(0, x-r*2):min(gray.shape[1], x+r*2)]
-                        if surrounding_roi.size > 0:
-                            contrast = brightness - np.mean(surrounding_roi)
-                            
-                            # 针对黑色背景优化评分策略
-                            avg_brightness = np.mean(gray)
-                            if avg_brightness < 80:  # 黑色背景下
-                                # 黑背景下更重视对比度，降低亮度要求
-                                score = brightness * 0.4 + contrast * 0.6
-                                # 额外加分：如果是真正的白点（亮度>150且对比度>50）
-                                if brightness > 150 and contrast > 50:
-                                    score += 50
-                            else:  # 正常背景下
-                                score = brightness * 0.7 + contrast * 0.3
-                                
-                            if score > max_brightness:
-                                max_brightness = score
-                                best_circle = (x, y, r)
+                    metrics = self.evaluate_circle_candidate(frame, gray, x, y, r)
+                    if metrics is None:
+                        continue
+
+                    brightness = metrics["mean"]
+                    contrast = metrics["contrast"]
+
+                    if frame_avg_brightness < 80:
+                        score = brightness * 0.4 + contrast * 0.6
+                        if brightness > 150 and contrast > 50:
+                            score += 50
+                    else:
+                        score = brightness * 0.7 + contrast * 0.3
+
+                    if score > max_brightness:
+                        max_brightness = score
+                        best_circle = (x, y, r)
             
             # 更新最后检测到的位置
             if best_circle is not None:
@@ -172,79 +172,155 @@ class GazeAnalyzer:
         
         return is_steering_wheel
     
-    def detect_with_proximity_priority(self, gray, left_exclude, right_exclude, top_exclude):
+    def evaluate_circle_candidate(self, frame, gray, x, y, r):
+        """Compute metrics for a detected circle and filter out open rings or noisy blobs."""
+        h, w = gray.shape
+        radius = int(max(2, round(r)))
+        if radius <= 1:
+            return None
+        pad = max(radius + 2, int(radius * 1.5))
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(w, x + pad + 1)
+        y2 = min(h, y + pad + 1)
+        roi_gray = gray[y1:y2, x1:x2]
+        if roi_gray.size == 0:
+            return None
+        center = (x - x1, y - y1)
+        mask = np.zeros_like(roi_gray, dtype=np.uint8)
+        cv2.circle(mask, center, radius, 255, -1)
+        circle_pixels = roi_gray[mask == 255]
+        min_pixels = max(10, int(np.pi * radius * radius * 0.45))
+        if circle_pixels.size < min_pixels:
+            return None
+        circle_pixels = circle_pixels.astype(np.float32)
+        mean_intensity = float(np.mean(circle_pixels))
+        if mean_intensity < 90:
+            return None
+        std_intensity = float(np.std(circle_pixels))
+        std_ratio = std_intensity / (mean_intensity + 1e-6)
+        inner_r = max(1, int(radius * 0.55))
+        inner_mask = np.zeros_like(mask, dtype=np.uint8)
+        cv2.circle(inner_mask, center, inner_r, 255, -1)
+        inner_pixels = roi_gray[inner_mask == 255]
+        inner_mean = float(np.mean(inner_pixels)) if inner_pixels.size > 0 else mean_intensity
+        ring_mask = np.zeros_like(mask, dtype=np.uint8)
+        cv2.circle(ring_mask, center, radius, 255, -1)
+        ring_inner_r = max(inner_r, int(radius * 0.75))
+        cv2.circle(ring_mask, center, ring_inner_r, 0, -1)
+        ring_pixels = roi_gray[ring_mask == 255]
+        ring_mean = float(np.mean(ring_pixels)) if ring_pixels.size > 0 else mean_intensity
+        _, binary = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        fill_pixels = int(np.sum((binary == 255) & (mask == 255)))
+        fill_ratio = fill_pixels / circle_pixels.size
+        perimeter_mask = np.zeros_like(mask, dtype=np.uint8)
+        cv2.circle(perimeter_mask, center, radius, 255, 1)
+        perimeter_pixels = roi_gray[perimeter_mask == 255].astype(np.float32)
+        perimeter_threshold = mean_intensity - 12.0
+        if perimeter_pixels.size > 0:
+            perimeter_ratio = float(np.mean(perimeter_pixels > perimeter_threshold))
+        else:
+            perimeter_ratio = 1.0
+        surround_x1 = max(0, x - radius * 2)
+        surround_y1 = max(0, y - radius * 2)
+        surround_x2 = min(w, x + radius * 2 + 1)
+        surround_y2 = min(h, y + radius * 2 + 1)
+        surrounding_roi = gray[surround_y1:surround_y2, surround_x1:surround_x2]
+        if surrounding_roi.size > 0:
+            contrast = mean_intensity - float(np.mean(surrounding_roi))
+        else:
+            contrast = 0.0
+        color_std = None
+        if frame is not None:
+            roi_color = frame[y1:y2, x1:x2]
+            if roi_color.size > 0:
+                circle_colors = roi_color[mask == 255].astype(np.float32)
+                if circle_colors.size > 0:
+                    color_std = float(np.mean(np.std(circle_colors, axis=0)))
+        ring_gap = ring_mean - inner_mean
+        if fill_ratio < self.min_circle_fill_ratio:
+            return None
+        if perimeter_ratio < self.min_perimeter_brightness_ratio:
+            return None
+        if ring_gap > self.max_ring_intensity_gap and inner_mean < 175:
+            return None
+        if std_ratio > self.max_circle_std_ratio and fill_ratio < 0.85:
+            return None
+        if color_std is not None and color_std > self.max_color_std_for_circle and fill_ratio < 0.8:
+            return None
+        return {
+            "mean": mean_intensity,
+            "contrast": contrast,
+            "fill_ratio": fill_ratio,
+            "std_ratio": std_ratio,
+            "ring_diff": ring_gap,
+            "perimeter_ratio": perimeter_ratio,
+            "color_std": color_std,
+            "inner_mean": inner_mean,
+            "ring_mean": ring_mean,
+        }
+
+    def detect_with_proximity_priority(self, frame, gray, left_exclude, right_exclude, top_exclude):
         """近处优先检测：在上一帧位置周围逐步扩大搜索范围"""
         if self.last_gaze_position is None:
             return None
-            
+
         last_x, last_y = self.last_gaze_position
         h, w = gray.shape
-        
-        # 逐步扩大搜索半径：128, 256, 384...
+
         for search_radius in [128, 256, 384]:
-            # 定义搜索区域
             search_x1 = max(left_exclude, last_x - search_radius)
             search_y1 = max(top_exclude, last_y - search_radius)
             search_x2 = min(right_exclude, last_x + search_radius)
             search_y2 = min(h, last_y + search_radius)
-            
-            # 如果搜索区域太小，跳过
+
             if search_x2 - search_x1 < 50 or search_y2 - search_y1 < 50:
                 continue
-            
-            # 在搜索区域内检测圆形
+
             search_roi = gray[search_y1:search_y2, search_x1:search_x2]
-            
-            # 使用高敏感度参数在近处搜索
+
             circles = cv2.HoughCircles(
                 search_roi,
                 cv2.HOUGH_GRADIENT,
                 dp=1,
                 minDist=20,
-                param1=35,   # 降低阈值提高敏感度
-                param2=25,   # 降低累加器阈值
+                param1=35,
+                param2=25,
                 minRadius=3,
                 maxRadius=12
             )
-            
+
             if circles is not None:
                 circles = np.round(circles[0, :]).astype("int")
-                
-                # 找到距离上一帧位置最近的圆
+
                 best_circle = None
                 min_distance = float('inf')
-                
+
                 for (rel_x, rel_y, r) in circles:
-                    # 转换为全图坐标
                     abs_x = rel_x + search_x1
                     abs_y = rel_y + search_y1
-                    
-                    # 检查是否在有效区域
+
                     if not (left_exclude <= abs_x <= right_exclude and abs_y >= top_exclude):
                         continue
-                    
-                    # 检查是否是方向盘按钮
+
                     if self.is_steering_wheel_button(gray, abs_x, abs_y, r):
                         continue
-                    
-                    # 计算距离上一帧的距离
+
+                    metrics = self.evaluate_circle_candidate(frame, gray, abs_x, abs_y, r)
+                    if metrics is None:
+                        continue
+
                     distance = ((abs_x - last_x) ** 2 + (abs_y - last_y) ** 2) ** 0.5
-                    
-                    # 验证圆的质量
-                    roi = gray[max(0, abs_y-r):min(h, abs_y+r),
-                             max(0, abs_x-r):min(w, abs_x+r)]
-                    if roi.size > 0:
-                        brightness = np.mean(roi)
-                        # 基本亮度要求
-                        if brightness > 100 and distance < min_distance:
-                            min_distance = distance
-                            best_circle = (abs_x, abs_y, r)
-                
+
+                    if metrics["mean"] > 100 and distance < min_distance:
+                        min_distance = distance
+                        best_circle = (abs_x, abs_y, r)
+
                 if best_circle is not None:
                     return best_circle
-        
+
         return None
-    
+
     def create_black_region_mask(self, gray):
         """创建黑色区域的mask"""
         # 使用自适应阈值检测黑色区域
@@ -267,66 +343,58 @@ class GazeAnalyzer:
         
         return np.zeros_like(gray)
     
-    def detect_in_black_region(self, gray, black_mask, left_exclude, right_exclude, top_exclude):
-        """在黑色区域内用高敏感度检测白圈"""
+    def detect_in_black_region(self, frame, gray, black_mask, left_exclude, right_exclude, top_exclude):
+        """在黑色区域内用高敏感度检测白点"""
         if black_mask is None:
             return None
-        
-        # 在黑色区域内使用超高敏感度参数
+
         circles = cv2.HoughCircles(
             gray,
             cv2.HOUGH_GRADIENT,
             dp=1,
-            minDist=15,   # 更小的最小距离
-            param1=25,    # 更低的边缘检测阈值
-            param2=15,    # 更低的累加器阈值
+            minDist=15,
+            param1=25,
+            param2=15,
             minRadius=3,
             maxRadius=12
         )
-        
-        if circles is not None:
-            circles = np.round(circles[0, :]).astype("int")
-            
-            best_circle = None
-            max_score = 0
-            
-            for (x, y, r) in circles:
-                # 检查是否在有效区域
-                if not (left_exclude <= x <= right_exclude and y >= top_exclude):
-                    continue
-                
-                # 检查是否在黑色区域内
-                if black_mask[y, x] == 0:  # 不在黑色区域内
-                    continue
-                
-                # 检查是否是方向盘按钮
-                if self.is_steering_wheel_button(gray, x, y, r):
-                    continue
-                
-                # 计算在黑色区域内的评分
-                roi = gray[max(0, y-r):min(gray.shape[0], y+r),
-                          max(0, x-r):min(gray.shape[1], x+r)]
-                
-                if roi.size > 0:
-                    brightness = np.mean(roi)
-                    
-                    # 黑色区域内的白点应该有很高的亮度
-                    if brightness > 120:  # 在黑色背景中的白点
-                        # 计算与周围黑色区域的对比度
-                        surrounding_roi = gray[max(0, y-r*2):min(gray.shape[0], y+r*2),
-                                             max(0, x-r*2):min(gray.shape[1], x+r*2)]
-                        if surrounding_roi.size > 0:
-                            contrast = brightness - np.mean(surrounding_roi)
-                            score = brightness + contrast * 2  # 重视对比度
-                            
-                            if score > max_score:
-                                max_score = score
-                                best_circle = (x, y, r)
-            
-            return best_circle
-        
-        return None
-    
+
+        if circles is None:
+            return None
+
+        circles = np.round(circles[0, :]).astype("int")
+
+        best_circle = None
+        max_score = 0.0
+
+        for (x, y, r) in circles:
+            if not (left_exclude <= x <= right_exclude and y >= top_exclude):
+                continue
+
+            if black_mask[y, x] == 0:
+                continue
+
+            if self.is_steering_wheel_button(gray, x, y, r):
+                continue
+
+            metrics = self.evaluate_circle_candidate(frame, gray, x, y, r)
+            if metrics is None:
+                continue
+
+            brightness = metrics["mean"]
+            contrast = metrics["contrast"]
+
+            if brightness < 120:
+                continue
+
+            score = brightness + contrast * 2.0
+
+            if score > max_score:
+                max_score = score
+                best_circle = (x, y, r)
+
+        return best_circle
+
     def analyze_gaze_region(self, frame, gaze_x, gaze_y):
         """分析视线点周围区域判断是现实还是虚拟"""
         h, w = frame.shape[:2]
