@@ -3,7 +3,7 @@
 ## 中文说明
 
 ### 项目概述
-本项目包含两个Python脚本，用于处理眼动实验数据，支持Adobe Premiere Pro编辑流程和数据分析。
+本项目包含三个Python脚本，用于处理眼动实验数据，支持Adobe Premiere Pro编辑流程、数据分析和可视化预览。
 
 ### 主要功能
 
@@ -31,6 +31,27 @@
   - 百分比计算（持续时间/90）
   - 每个Mode的记录数量统计
 
+#### 3. gaze_preview.py - 可视化预览工具
+- **功能**: 为每段视频生成带标注的MP4预览文件，提供"所见即所得"的可视化效果
+- **可视化内容**:
+  - **黄色轮廓/线条**: 检测到的黑区掩码位置和分界线
+  - **白色轨迹**: 视线点最近20帧的运动轨迹
+  - **彩色圆点**: 当前视线位置（绿色=virtual、红色=real、灰色=unknown）
+  - **HUD信息**: 左上角显示当前分类标签和置信度条
+- **核心算法**:
+  - 黑区检测：使用Otsu阈值法和形态学处理
+  - 视线检测：基于Blob检测，自动过滤鼠标指针干扰
+  - 分类算法：采用滞后机制和无决策带，提高分类稳定性
+  - 置信度计算：基于视线点到黑区边界的距离
+- **使用方法**:
+  ```bash
+  # 安装依赖
+  pip install opencv-python numpy
+  
+  # 运行预览
+  python gaze_preview.py "视频文件夹路径" --out "输出文件夹" --preview
+  ```
+
 ### 数据文件夹说明
 
 #### excelFile/
@@ -44,14 +65,15 @@
 1. 将原始数据文件放入`excelFile/`文件夹
 2. 运行`process_excel.py`进行数据处理和分析
 3. 运行`create_edl.py`生成PR项目所需的EDL文件
-4. 将EDL文件导入Adobe Premiere Pro进行视频编辑
+4. 运行`gaze_preview.py`生成可视化预览视频（可选）
+5. 将EDL文件导入Adobe Premiere Pro进行视频编辑
 
 ---
 
 ## English Description
 
 ### Project Overview
-This project contains two Python scripts for processing eye-tracking experiment data, supporting Adobe Premiere Pro editing workflows and data analysis.
+This project contains three Python scripts for processing eye-tracking experiment data, supporting Adobe Premiere Pro editing workflows, data analysis, and visualization preview.
 
 ### Main Features
 
@@ -79,6 +101,27 @@ This project contains two Python scripts for processing eye-tracking experiment 
   - Percentage calculations (duration/90)
   - Record count statistics for each Mode
 
+#### 3. gaze_preview.py - Visualization Preview Tool
+- **Function**: Generates annotated MP4 preview files for each video segment, providing "what you see is what you get" visualization
+- **Visualization Content**:
+  - **Yellow contours/lines**: Detected black region mask position and boundary lines
+  - **White trail**: Gaze point trajectory for the last 20 frames
+  - **Colored dots**: Current gaze position (green=virtual, red=real, gray=unknown)
+  - **HUD information**: Top-left display of current classification label and confidence bar
+- **Core Algorithms**:
+  - Black region detection: Uses Otsu thresholding and morphological processing
+  - Gaze detection: Based on Blob detection with automatic mouse pointer filtering
+  - Classification algorithm: Employs hysteresis mechanism and no-decision band for improved stability
+  - Confidence calculation: Based on distance from gaze point to black region boundary
+- **Usage**:
+  ```bash
+  # Install dependencies
+  pip install opencv-python numpy
+  
+  # Run preview generation
+  python gaze_preview.py "video_folder_path" --out "output_folder" --preview
+  ```
+
 ### Data Folder Description
 
 #### excelFile/
@@ -92,7 +135,8 @@ This project contains two Python scripts for processing eye-tracking experiment 
 1. Place raw data files in the `excelFile/` folder
 2. Run `process_excel.py` for data processing and analysis
 3. Run `create_edl.py` to generate EDL files needed for PR projects
-4. Import EDL files into Adobe Premiere Pro for video editing
+4. Run `gaze_preview.py` to generate visualization preview videos (optional)
+5. Import EDL files into Adobe Premiere Pro for video editing
 
 ### Technical Specifications
 - **Frame Rate Standard**: 20,000 frames per segment
@@ -106,4 +150,5 @@ This project contains two Python scripts for processing eye-tracking experiment 
 - Python 3.x
 - pandas
 - numpy
+- opencv-python (for gaze_preview.py)
 - Adobe Premiere Pro (for EDL import)

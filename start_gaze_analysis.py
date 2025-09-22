@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-# start_gaze_analysis.py - 简化启动脚本
+"""
+VR眼动数据分析启动器 / VR Gaze Data Analysis Launcher
+
+功能说明：
+- 简化的启动脚本，提供友好的用户界面
+- 检查依赖库和数据文件夹
+- 提供多种启动模式选择
+- 自动调用主分析程序
+
+作者：Weihao
+版本：1.0
+文件名：start_gaze_analysis.py
+"""
 import os
 import sys
 
@@ -42,10 +54,9 @@ def main():
     print("1. 标准模式（有实时预览）")
     print("2. 批处理模式（无预览，适合批量处理）")
     print("3. 调试模式（显示详细检测信息）")
-    print("4. 高级调试模式（解决方向盘误判问题）")
     
     try:
-        choice = input("\n请选择模式 (1-4, 默认1): ").strip()
+        choice = input("\n请选择模式 (1-3, 默认1): ").strip()
         
         if choice == '2':
             # 批处理模式
@@ -56,33 +67,12 @@ def main():
             threshold = input("黑色检测阈值 (0-255, 默认30): ").strip()
             radius = input("检测半径 (像素, 默认20): ").strip()
             
-            cmd = "python gaze_analyzer.py --debug"
+            cmd = "python gaze_analyzer.py"
             if threshold:
                 cmd += f" --black-threshold {threshold}"
             if radius:
                 cmd += f" --radius {radius}"
             
-            os.system(cmd)
-        elif choice == '4':
-            # 高级调试模式
-            print("\n🔧 高级调试模式 - 解决方向盘按钮误判问题")
-            print("这个模式会显示所有检测到的圆形和它们的评分")
-            print("绿色圆圈 = 可能是视线点，红色圆圈 = 可能是方向盘按钮")
-            print()
-            
-            threshold = input("黑色检测阈值 (0-255, 默认30): ").strip()
-            radius = input("检测半径 (像素, 默认20): ").strip()
-            gaze_threshold = input("视线点评分阈值 (0.0-1.0, 默认0.5): ").strip()
-            
-            cmd = "python gaze_analyzer.py --debug"
-            if threshold:
-                cmd += f" --black-threshold {threshold}"
-            if radius:
-                cmd += f" --radius {radius}"
-            if gaze_threshold:
-                cmd += f" --gaze-threshold {gaze_threshold}"
-            
-            print(f"\n🚀 启动命令: {cmd}")
             os.system(cmd)
         else:
             # 标准模式
