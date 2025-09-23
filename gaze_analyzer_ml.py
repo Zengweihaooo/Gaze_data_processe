@@ -10,7 +10,8 @@ from gaze_analyzer import GazeAnalyzer, get_video_files
 GAZE_FEATURES = ['mean', 'contrast', 'fill_ratio', 'std_ratio', 'ring_diff', 'perimeter_ratio',
                  'perimeter_std', 'color_std', 'inner_mean', 'ring_mean', 'eccentricity']
 SCENE_FEATURES = ['dark_ratio_full', 'edge_density_full', 'dark_ratio_top', 'edge_density_top',
-                  'sat_mean_top', 'color_std_top', 'mask_ratio_full', 'largest_region_ratio']
+                  'sat_mean_top', 'color_std_top', 'mask_ratio_full', 'largest_region_ratio',
+                  'bottom_dark_ratio', 'bottom_edge_density', 'bottom_mask_ratio', 'scene_proba']
 
 
 class MLGazeAnalyzer(GazeAnalyzer):
@@ -93,6 +94,9 @@ class MLGazeAnalyzer(GazeAnalyzer):
                     except Exception as exc:
                         print(f"[WARN] Scene classifier failed: {exc}")
 
+                scene_guess = self.update_scene_history(scene_features.get('scene_guess', scene_guess))
+                scene_features['scene_guess'] = scene_guess
+
                 raw_state = 'virtual'
 
                 if detection_result:
@@ -120,11 +124,13 @@ class MLGazeAnalyzer(GazeAnalyzer):
                     else:
                         detection_result = None
                 else:
+                    scene_guess = self.update_scene_history(scene_guess)
                     raw_state = scene_guess
 
                 self.update_state(raw_state, frame_num, fps)
                 stable_state = self.current_state if self.current_state is not None else raw_state
 
+                self.apply_reality_overlay(frame, black_mask, stable_state)
                 self.draw_indicator(frame, stable_state)
 
                 if black_mask is not None:

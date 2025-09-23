@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 import os
 import pandas as pd
-from collections import defaultdict
+from collections import defaultdict, Counter, deque
 import argparse
 import json
 import glob
@@ -50,20 +50,23 @@ class GazeAnalyzer:
         self.max_perimeter_radius_std = 0.3
         self.max_eccentricity_ratio = 1.8
         # 场景判断参数
-        self.scene_dark_ratio_real_min = 0.55
-        self.scene_edge_real_max = 0.05
-        self.scene_color_std_real_max = 18.0
-        self.scene_largest_real_min = 0.45
-        self.scene_edge_virtual_min = 0.07
-        self.scene_sat_virtual_min = 30.0
-        self.scene_color_std_virtual_min = 22.0
-        self.scene_dark_virtual_max = 0.35
+        self.scene_dark_ratio_real_min = 0.72
+        self.scene_edge_real_max = 0.04
+        self.scene_color_std_real_max = 12.0
+        self.scene_largest_real_min = 0.55
+        self.scene_edge_virtual_min = 0.08
+        self.scene_sat_virtual_min = 28.0
+        self.scene_color_std_virtual_min = 20.0
+        self.scene_dark_virtual_max = 0.5
 
 
         # 状态稳定控制
         self.transition_hold_frames = 3
         self.pending_state = None
         self.pending_start_frame = 0
+
+        # 场景平滑历史
+        self.scene_vote_history = deque(maxlen=15)
 
     def load_model(self, model_path):
         """Load threshold overrides from a JSON profile"""
@@ -549,13 +552,18 @@ class GazeAnalyzer:
             if mask_roi.size > 0:
                 mask_ratio = float(np.mean(mask_roi > 0))
 
-        if mask_ratio > 0.45 and edge_density < 0.06 and avg_brightness < 120:
+        bottom_dark = scene_features.get('bottom_dark_ratio', 0.0) if scene_features else 0.0
+        bottom_mask = scene_features.get('bottom_mask_ratio', 0.0) if scene_features else 0.0
+        bottom_edge = scene_features.get('bottom_edge_density', 0.0) if scene_features else 0.0
+
+        if bottom_dark > self.scene_dark_ratio_real_min and bottom_mask > 0.5 and bottom_edge < 0.04:
+            if edge_density < 0.06 and avg_brightness < 130:
+                return 'reality'
+
+        if scene_features and scene_features.get('scene_guess') == 'reality' and edge_density < 0.06:
             return 'reality'
 
-        if scene_features and scene_features.get('scene_guess') == 'reality' and edge_density < 0.08:
-            return 'reality'
-
-        if edge_density > 0.1 or avg_brightness > 130:
+        if edge_density > 0.1 or avg_brightness > 150:
             return 'virtual'
 
         if scene_features:
@@ -585,6 +593,12 @@ class GazeAnalyzer:
         features['sat_mean_top'] = float(np.mean(hsv_top[:, :, 1]))
         features['color_std_top'] = float(np.mean(np.std(top_roi.reshape(-1, 3), axis=0)))
 
+        bottom_roi = frame[top_h:, :]
+        gray_bottom = gray[top_h:, :]
+        edges_bottom = edges_full[top_h:, :]
+        features['bottom_dark_ratio'] = float(np.mean(gray_bottom < 45))
+        features['bottom_edge_density'] = float(np.mean(edges_bottom > 0))
+
         if black_mask is not None:
             mask_bool = black_mask > 0
             features['mask_ratio_full'] = float(np.mean(mask_bool))
@@ -594,9 +608,12 @@ class GazeAnalyzer:
                 features['largest_region_ratio'] = float(max(areas)) / float(h * w)
             else:
                 features['largest_region_ratio'] = 0.0
+            bottom_mask = black_mask[top_h:, :]
+            features['bottom_mask_ratio'] = float(np.mean(bottom_mask > 0))
         else:
             features['mask_ratio_full'] = 0.0
             features['largest_region_ratio'] = 0.0
+            features['bottom_mask_ratio'] = 0.0
 
         features['scene_guess'] = self.estimate_scene_state(features)
         return features
@@ -611,41 +628,23 @@ class GazeAnalyzer:
         color_std = features.get('color_std_top', 0.0)
         sat_top = features.get('sat_mean_top', 0.0)
         largest = features.get('largest_region_ratio', 0.0)
+        bottom_dark = features.get('bottom_dark_ratio', 0.0)
+        bottom_edge = features.get('bottom_edge_density', 0.0)
+        bottom_mask = features.get('bottom_mask_ratio', 0.0)
 
-        if dark_top > self.scene_dark_ratio_real_min and edge_top < self.scene_edge_real_max and color_std < self.scene_color_std_real_max:
+        if bottom_dark > self.scene_dark_ratio_real_min and bottom_mask > 0.55 and bottom_edge < 0.04:
+            return 'reality'
+        if dark_top > self.scene_dark_ratio_real_min and edge_top < self.scene_edge_real_max and color_std < self.scene_color_std_real_max and bottom_edge < 0.05:
             return 'reality'
         if largest > self.scene_largest_real_min and edge_top < self.scene_edge_real_max and color_std < self.scene_color_std_real_max:
             return 'reality'
+
         if edge_top > self.scene_edge_virtual_min or sat_top > self.scene_sat_virtual_min or color_std > self.scene_color_std_virtual_min:
             return 'virtual'
-        if dark_top < self.scene_dark_virtual_max:
+        if bottom_dark < self.scene_dark_virtual_max or bottom_edge > 0.08:
             return 'virtual'
+
         return default
-    def draw_indicator(self, frame, state):
-        """在左上角绘制状态指示器"""
-        x, y = self.indicator_pos
-        w, h = self.indicator_size
-        
-        # 选择颜色
-        if state == 'reality':
-            color = (0, 255, 0)  # 绿色
-            text = 'REALITY'
-        elif state == 'virtual':
-            color = (0, 0, 255)  # 红色
-            text = 'VIRTUAL'
-        else:
-            color = (128, 128, 128)  # 灰色
-            text = 'UNKNOWN'
-        
-        # 绘制矩形指示器
-        cv2.rectangle(frame, (x, y), (x + w, y + h), color, -1)
-        
-        # 添加文字
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        text_size = cv2.getTextSize(text, font, 0.6, 2)[0]
-        text_x = x + (w - text_size[0]) // 2
-        text_y = y + (h + text_size[1]) // 2
-        cv2.putText(frame, text, (text_x, text_y), font, 0.6, (255, 255, 255), 2)
     def draw_mask_indicator(self, frame, source_frame, black_mask, scene_features=None):
         """Render frame/mask comparison thumbnail with stats"""
         if black_mask is None:
@@ -682,14 +681,18 @@ class GazeAnalyzer:
 
         if scene_features:
             dark_top = scene_features.get('dark_ratio_top', 0.0)
-            largest = scene_features.get('largest_region_ratio', 0.0)
             edge_top = scene_features.get('edge_density_top', 0.0)
+            bottom_dark = scene_features.get('bottom_dark_ratio', 0.0)
+            bottom_mask = scene_features.get('bottom_mask_ratio', 0.0)
             sat_top = scene_features.get('sat_mean_top', 0.0)
+            largest = scene_features.get('largest_region_ratio', 0.0)
             guess = scene_features.get('scene_guess', 'n/a').upper()
-            label1 = f"DarkTop:{dark_top:.2f} LR:{largest:.2f}"
-            label2 = f"EdgeTop:{edge_top:.2f} Sat:{sat_top:.1f} Scene:{guess}"
-            cv2.putText(frame, label1, (thumb_x + 5, thumb_y + thumb_h - 25), font, 0.42, (200, 255, 200), 1)
-            cv2.putText(frame, label2, (thumb_x + 5, thumb_y + thumb_h - 8), font, 0.42, (200, 255, 200), 1)
+            label1 = f"DarkTop:{dark_top:.2f} EdgeTop:{edge_top:.2f}"
+            label2 = f"BottomDark:{bottom_dark:.2f} BottomMask:{bottom_mask:.2f}"
+            label3 = f"Largest:{largest:.2f} SatTop:{sat_top:.1f} Scene:{guess}"
+            cv2.putText(frame, label1, (thumb_x + 5, thumb_y + thumb_h - 33), font, 0.42, (200, 255, 200), 1)
+            cv2.putText(frame, label2, (thumb_x + 5, thumb_y + thumb_h - 17), font, 0.42, (200, 255, 200), 1)
+            cv2.putText(frame, label3, (thumb_x + 5, thumb_y + thumb_h - 1), font, 0.42, (200, 255, 200), 1)
     def update_state(self, raw_state, frame_num, fps):
         """Update stable state with hysteresis"""
         if raw_state == 'unknown':
@@ -769,6 +772,9 @@ class GazeAnalyzer:
         self.current_state = None
         self.pending_state = None
         self.pending_start_frame = 0
+
+        # 场景平滑历史
+        self.scene_vote_history = deque(maxlen=15)
         self.last_gaze_position = None
 
         frame_num = 0
@@ -790,6 +796,8 @@ class GazeAnalyzer:
                 detection_result, black_mask = self.detect_gaze_circle(frame)
                 scene_features = self.compute_scene_features(frame, black_mask)
                 scene_guess = scene_features.get('scene_guess', 'virtual')
+                scene_guess = self.update_scene_history(scene_guess)
+                scene_features['scene_guess'] = scene_guess
 
                 if detection_result:
                     gaze_x, gaze_y, radius = detection_result
@@ -802,6 +810,7 @@ class GazeAnalyzer:
                 self.update_state(raw_state, frame_num, fps)
                 stable_state = self.current_state if self.current_state is not None else raw_state
 
+                self.apply_reality_overlay(frame, black_mask, stable_state)
                 self.draw_indicator(frame, stable_state)
 
                 if black_mask is not None:

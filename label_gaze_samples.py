@@ -12,7 +12,8 @@ from gaze_analyzer import GazeAnalyzer
 GAZE_FIELDS = ['mean', 'contrast', 'fill_ratio', 'std_ratio', 'ring_diff', 'perimeter_ratio',
                'perimeter_std', 'color_std', 'inner_mean', 'ring_mean', 'eccentricity']
 SCENE_FIELDS = ['dark_ratio_full', 'edge_density_full', 'dark_ratio_top', 'edge_density_top',
-                'sat_mean_top', 'color_std_top', 'mask_ratio_full', 'largest_region_ratio']
+                'sat_mean_top', 'color_std_top', 'mask_ratio_full', 'largest_region_ratio',
+                'bottom_dark_ratio', 'bottom_edge_density', 'bottom_mask_ratio', 'scene_proba']
 STATUS_GREEN = (0, 255, 0)
 STATUS_RED = (0, 0, 255)
 STATUS_YELLOW = (0, 200, 255)
