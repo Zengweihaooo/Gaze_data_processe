@@ -49,6 +49,16 @@ class GazeAnalyzer:
         self.max_color_std_for_circle = 35.0
         self.max_perimeter_radius_std = 0.3
         self.max_eccentricity_ratio = 1.8
+        # 场景判断参数
+        self.scene_dark_ratio_real_min = 0.55
+        self.scene_edge_real_max = 0.05
+        self.scene_color_std_real_max = 18.0
+        self.scene_largest_real_min = 0.45
+        self.scene_edge_virtual_min = 0.07
+        self.scene_sat_virtual_min = 30.0
+        self.scene_color_std_virtual_min = 22.0
+        self.scene_dark_virtual_max = 0.35
+
 
         # 状态稳定控制
         self.transition_hold_frames = 3
@@ -77,7 +87,15 @@ class GazeAnalyzer:
             'max_color_std_for_circle': 'max_color_std_for_circle',
             'max_perimeter_radius_std': 'max_perimeter_radius_std',
             'max_eccentricity_ratio': 'max_eccentricity_ratio',
-            'transition_hold_frames': 'transition_hold_frames'
+            'transition_hold_frames': 'transition_hold_frames',
+            'scene_dark_ratio_real_min': 'scene_dark_ratio_real_min',
+            'scene_edge_real_max': 'scene_edge_real_max',
+            'scene_color_std_real_max': 'scene_color_std_real_max',
+            'scene_largest_real_min': 'scene_largest_real_min',
+            'scene_edge_virtual_min': 'scene_edge_virtual_min',
+            'scene_sat_virtual_min': 'scene_sat_virtual_min',
+            'scene_color_std_virtual_min': 'scene_color_std_virtual_min',
+            'scene_dark_virtual_max': 'scene_dark_virtual_max',
         }
 
         for key, attr in mapping.items():
@@ -507,37 +525,102 @@ class GazeAnalyzer:
 
         return best_circle
 
-    def analyze_gaze_region(self, frame, gaze_x, gaze_y):
-        """分析视线点周围区域判断是现实还是虚拟"""
+    def analyze_gaze_region(self, frame, gaze_x, gaze_y, black_mask=None, scene_features=None):
+        """Classify whether the gaze region looks real-world or virtual"""
         h, w = frame.shape[:2]
-        
-        # 确保检测区域在图像范围内
+
         x1 = max(0, gaze_x - self.detection_radius)
         y1 = max(0, gaze_y - self.detection_radius)
         x2 = min(w, gaze_x + self.detection_radius)
         y2 = min(h, gaze_y + self.detection_radius)
-        
-        # 提取检测区域
+
         roi = frame[y1:y2, x1:x2]
-        
         if roi.size == 0:
             return 'unknown'
-        
-        # 转换为灰度并计算平均亮度
+
         gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        avg_brightness = np.mean(gray_roi)
-        
-        # 计算黑色像素比例
-        black_pixels = np.sum(gray_roi < self.black_threshold)
-        total_pixels = gray_roi.size
-        black_ratio = black_pixels / total_pixels
-        
-        # 判断逻辑：如果黑色像素比例超过50%或平均亮度很低，认为是现实世界
-        if black_ratio > 0.5 or avg_brightness < self.black_threshold:
+        avg_brightness = float(np.mean(gray_roi))
+        edge_roi = cv2.Canny(gray_roi, 40, 120)
+        edge_density = float(np.mean(edge_roi > 0))
+
+        mask_ratio = 0.0
+        if black_mask is not None:
+            mask_roi = black_mask[y1:y2, x1:x2]
+            if mask_roi.size > 0:
+                mask_ratio = float(np.mean(mask_roi > 0))
+
+        if mask_ratio > 0.45 and edge_density < 0.06 and avg_brightness < 120:
             return 'reality'
-        else:
+
+        if scene_features and scene_features.get('scene_guess') == 'reality' and edge_density < 0.08:
+            return 'reality'
+
+        if edge_density > 0.1 or avg_brightness > 130:
             return 'virtual'
-    
+
+        if scene_features:
+            return scene_features.get('scene_guess', 'virtual')
+        return 'virtual'
+
+    def compute_scene_features(self, frame, black_mask=None):
+        """Extract global features for scene classification"""
+        h, w = frame.shape[:2]
+        features = {}
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        edges_full = cv2.Canny(gray, 60, 160)
+        features['edge_density_full'] = float(np.mean(edges_full > 0))
+
+        dark_mask = gray < 45
+        features['dark_ratio_full'] = float(np.mean(dark_mask))
+
+        top_h = int(h * 0.55)
+        top_roi = frame[:top_h, :]
+        gray_top = gray[:top_h, :]
+        edges_top = edges_full[:top_h, :]
+        hsv_top = cv2.cvtColor(top_roi, cv2.COLOR_BGR2HSV)
+
+        features['edge_density_top'] = float(np.mean(edges_top > 0))
+        features['dark_ratio_top'] = float(np.mean(gray_top < 45))
+        features['sat_mean_top'] = float(np.mean(hsv_top[:, :, 1]))
+        features['color_std_top'] = float(np.mean(np.std(top_roi.reshape(-1, 3), axis=0)))
+
+        if black_mask is not None:
+            mask_bool = black_mask > 0
+            features['mask_ratio_full'] = float(np.mean(mask_bool))
+            contours, _ = cv2.findContours(black_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                areas = [cv2.contourArea(c) for c in contours]
+                features['largest_region_ratio'] = float(max(areas)) / float(h * w)
+            else:
+                features['largest_region_ratio'] = 0.0
+        else:
+            features['mask_ratio_full'] = 0.0
+            features['largest_region_ratio'] = 0.0
+
+        features['scene_guess'] = self.estimate_scene_state(features)
+        return features
+
+    def estimate_scene_state(self, features, default='virtual'):
+        """Guess overall scene using extracted features"""
+        if not features:
+            return default
+
+        dark_top = features.get('dark_ratio_top', 0.0)
+        edge_top = features.get('edge_density_top', 0.0)
+        color_std = features.get('color_std_top', 0.0)
+        sat_top = features.get('sat_mean_top', 0.0)
+        largest = features.get('largest_region_ratio', 0.0)
+
+        if dark_top > self.scene_dark_ratio_real_min and edge_top < self.scene_edge_real_max and color_std < self.scene_color_std_real_max:
+            return 'reality'
+        if largest > self.scene_largest_real_min and edge_top < self.scene_edge_real_max and color_std < self.scene_color_std_real_max:
+            return 'reality'
+        if edge_top > self.scene_edge_virtual_min or sat_top > self.scene_sat_virtual_min or color_std > self.scene_color_std_virtual_min:
+            return 'virtual'
+        if dark_top < self.scene_dark_virtual_max:
+            return 'virtual'
+        return default
     def draw_indicator(self, frame, state):
         """在左上角绘制状态指示器"""
         x, y = self.indicator_pos
@@ -563,22 +646,21 @@ class GazeAnalyzer:
         text_x = x + (w - text_size[0]) // 2
         text_y = y + (h + text_size[1]) // 2
         cv2.putText(frame, text, (text_x, text_y), font, 0.6, (255, 255, 255), 2)
-    def draw_mask_indicator(self, frame, source_frame, black_mask):
-        """Render frame/mask comparison thumbnail"""
+    def draw_mask_indicator(self, frame, source_frame, black_mask, scene_features=None):
+        """Render frame/mask comparison thumbnail with stats"""
+        if black_mask is None:
+            return
+
         h, w = frame.shape[:2]
 
-        thumb_w = max(60, min(120, w // 10))
-        thumb_h = max(45, min(90, int(thumb_w * 0.75)))
+        thumb_w = max(80, min(160, w // 8))
+        thumb_h = max(60, min(120, int(thumb_w * 0.75)))
 
         mask_resized = cv2.resize(black_mask, (thumb_w, thumb_h))
         frame_resized = cv2.resize(source_frame, (thumb_w, thumb_h))
 
-        mask_overlay = cv2.merge([
-            np.zeros_like(mask_resized),
-            mask_resized,
-            np.zeros_like(mask_resized)
-        ])
-        overlay = cv2.addWeighted(frame_resized, 0.65, mask_overlay, 0.35, 0)
+        mask_overlay = cv2.merge([np.zeros_like(mask_resized), mask_resized, np.zeros_like(mask_resized)])
+        overlay = cv2.addWeighted(frame_resized, 0.55, mask_overlay, 0.45, 0)
         mask_colored = cv2.cvtColor(mask_resized, cv2.COLOR_GRAY2BGR)
 
         combined = np.hstack([frame_resized, overlay, mask_colored])
@@ -597,6 +679,17 @@ class GazeAnalyzer:
         cv2.rectangle(frame, (thumb_x, thumb_y), (thumb_x + total_w, thumb_y + thumb_h), (255, 255, 255), 1)
         font = cv2.FONT_HERSHEY_SIMPLEX
         cv2.putText(frame, 'Frame | Overlay | Mask', (thumb_x, thumb_y - 5), font, 0.4, (255, 255, 255), 1)
+
+        if scene_features:
+            dark_top = scene_features.get('dark_ratio_top', 0.0)
+            largest = scene_features.get('largest_region_ratio', 0.0)
+            edge_top = scene_features.get('edge_density_top', 0.0)
+            sat_top = scene_features.get('sat_mean_top', 0.0)
+            guess = scene_features.get('scene_guess', 'n/a').upper()
+            label1 = f"DarkTop:{dark_top:.2f} LR:{largest:.2f}"
+            label2 = f"EdgeTop:{edge_top:.2f} Sat:{sat_top:.1f} Scene:{guess}"
+            cv2.putText(frame, label1, (thumb_x + 5, thumb_y + thumb_h - 25), font, 0.42, (200, 255, 200), 1)
+            cv2.putText(frame, label2, (thumb_x + 5, thumb_y + thumb_h - 8), font, 0.42, (200, 255, 200), 1)
     def update_state(self, raw_state, frame_num, fps):
         """Update stable state with hysteresis"""
         if raw_state == 'unknown':
@@ -694,23 +787,17 @@ class GazeAnalyzer:
                     break
                 raw_frame_for_mask = frame.copy()
 
-                detection_result = self.detect_gaze_circle(frame)
+                detection_result, black_mask = self.detect_gaze_circle(frame)
+                scene_features = self.compute_scene_features(frame, black_mask)
+                scene_guess = scene_features.get('scene_guess', 'virtual')
 
-                raw_state = 'virtual'
-                gaze_circle = None
-                black_mask = None
-
-                if detection_result and len(detection_result) == 2:
-                    gaze_circle, black_mask = detection_result
-
-                if gaze_circle:
-                    gaze_x, gaze_y, radius = gaze_circle
-                    raw_state = self.analyze_gaze_region(frame, gaze_x, gaze_y)
+                if detection_result:
+                    gaze_x, gaze_y, radius = detection_result
+                    raw_state = self.analyze_gaze_region(frame, gaze_x, gaze_y, black_mask, scene_features)
                     cv2.circle(frame, (gaze_x, gaze_y), radius, (255, 255, 0), 2)
                     cv2.circle(frame, (gaze_x, gaze_y), self.detection_radius, (0, 255, 255), 1)
                 else:
-                    if black_mask is not None and np.sum(black_mask) > 1000:
-                        raw_state = 'reality'
+                    raw_state = scene_guess
 
                 self.update_state(raw_state, frame_num, fps)
                 stable_state = self.current_state if self.current_state is not None else raw_state
@@ -718,7 +805,7 @@ class GazeAnalyzer:
                 self.draw_indicator(frame, stable_state)
 
                 if black_mask is not None:
-                    self.draw_mask_indicator(frame, raw_frame_for_mask, black_mask)
+                    self.draw_mask_indicator(frame, raw_frame_for_mask, black_mask, scene_features)
 
                 if frame_num % 100 == 0 and total_frames > 0:
                     progress = (frame_num / total_frames) * 100
@@ -755,7 +842,6 @@ class GazeAnalyzer:
         self.generate_report(video_path, output_dir)
 
         return self.segments
-    
     def generate_report(self, video_path, output_dir):
         """生成分析报告"""
         if not self.segments:
