@@ -18,6 +18,7 @@ import os
 import pandas as pd
 from collections import defaultdict
 import argparse
+import json
 import glob
 
 class GazeAnalyzer:
@@ -46,102 +47,129 @@ class GazeAnalyzer:
         self.max_ring_intensity_gap = 25
         self.min_perimeter_brightness_ratio = 0.7
         self.max_color_std_for_circle = 35.0
-        
+        self.max_perimeter_radius_std = 0.3
+        self.max_eccentricity_ratio = 1.8
+
+        # 状态稳定控制
+        self.transition_hold_frames = 3
+        self.pending_state = None
+        self.pending_start_frame = 0
+
+    def load_model(self, model_path):
+        """Load threshold overrides from a JSON profile"""
+        if not model_path:
+            return
+        if not os.path.exists(model_path):
+            print(f"[WARN] Model file not found: {model_path}")
+            return
+        try:
+            with open(model_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as exc:
+            print(f"[WARN] Failed to load model {model_path}: {exc}")
+            return
+
+        mapping = {
+            'min_circle_fill_ratio': 'min_circle_fill_ratio',
+            'max_circle_std_ratio': 'max_circle_std_ratio',
+            'max_ring_intensity_gap': 'max_ring_intensity_gap',
+            'min_perimeter_brightness_ratio': 'min_perimeter_brightness_ratio',
+            'max_color_std_for_circle': 'max_color_std_for_circle',
+            'max_perimeter_radius_std': 'max_perimeter_radius_std',
+            'max_eccentricity_ratio': 'max_eccentricity_ratio',
+            'transition_hold_frames': 'transition_hold_frames'
+        }
+
+        for key, attr in mapping.items():
+            if key in data:
+                setattr(self, attr, data[key])
+        print(f"[INFO] Loaded gaze model from {model_path}")
+
+
     def detect_gaze_circle(self, frame):
-        """检测白色圆形视线点"""
-        # 转换为灰度图
+        """Detect bright circular gaze point"""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # 计算排除区域边界 - 排除顶部5%和左右两侧10%
+
         h, w = gray.shape
-        top_exclude = int(h * 0.05)      # 顶部5%
-        left_exclude = int(w * 0.23)     # 左侧10%
-        right_exclude = w - int(w * 0.23) # 右侧10%
-        
-        # 创建黑色区域mask
+        top_exclude = int(h * 0.05)
+        left_exclude = int(w * 0.23)
+        right_exclude = w - int(w * 0.23)
+
         black_mask = self.create_black_region_mask(gray)
-        
-        # 近处优先检测：如果有上一帧的位置，优先在附近搜索
+
         if self.last_gaze_position is not None:
-            proximity_circle = self.detect_with_proximity_priority(frame, gray, left_exclude, right_exclude, top_exclude)
+            proximity_circle = self.detect_with_proximity_priority(frame, gray, left_exclude, right_exclude, top_exclude, black_mask)
             if proximity_circle:
                 self.last_gaze_position = (proximity_circle[0], proximity_circle[1])
                 return proximity_circle, black_mask
-        
-        # 先尝试标准参数检测
+
         circles = cv2.HoughCircles(
             gray,
             cv2.HOUGH_GRADIENT,
             dp=1,
-            minDist=30,  # 减小最小距离避免方向盘圆圈干扰
-            param1=60,   # 提高边缘检测阈值
-            param2=35,   # 提高累加器阈值减少误识别
-            minRadius=3, # 减小50%: 5->3
-            maxRadius=12 # 减小50%: 25->12
+            minDist=30,
+            param1=60,
+            param2=35,
+            minRadius=3,
+            maxRadius=12
         )
-        
-        # 优先在黑色区域内用高敏感度检测
+
         black_region_circle = self.detect_in_black_region(frame, gray, black_mask, left_exclude, right_exclude, top_exclude)
         if black_region_circle:
             self.last_gaze_position = (black_region_circle[0], black_region_circle[1])
             return black_region_circle, black_mask
-        
-        # 如果黑色区域没检测到，使用标准参数在全图检测
+
         if circles is None:
             avg_brightness = np.mean(gray)
-            if avg_brightness < 80:  # 判断为暗背景
+            if avg_brightness < 80:
                 circles = cv2.HoughCircles(
                     gray,
                     cv2.HOUGH_GRADIENT,
                     dp=1,
-                    minDist=25,  # 进一步减小距离
-                    param1=40,   # 降低边缘检测阈值，增加敏感度
-                    param2=20,   # 大幅降低累加器阈值
+                    minDist=25,
+                    param1=40,
+                    param2=20,
                     minRadius=3,
                     maxRadius=12
                 )
-        
+
         if circles is not None:
             circles = np.round(circles[0, :]).astype("int")
             frame_avg_brightness = float(np.mean(gray))
-            
-            # 找到最亮的圆（可能是视线点）
+
             best_circle = None
-            max_brightness = 0
-            
+            max_score = -float('inf')
+
             for (x, y, r) in circles:
-                # 检查是否在有效检测区域内（排除顶部5%和左右两侧10%）
-                if (left_exclude <= x <= right_exclude and 
-                    y >= top_exclude and 
-                    0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]):
-                    # 检查是否是方向盘按钮（白色边界+黑色内部）
-                    if self.is_steering_wheel_button(gray, x, y, r):
-                        continue  # 跳过方向盘按钮
-                    
-                    metrics = self.evaluate_circle_candidate(frame, gray, x, y, r)
-                    if metrics is None:
-                        continue
+                if not (left_exclude <= x <= right_exclude and y >= top_exclude and 0 <= x < w and 0 <= y < h):
+                    continue
 
-                    brightness = metrics["mean"]
-                    contrast = metrics["contrast"]
+                if self.is_steering_wheel_button(gray, x, y, r):
+                    continue
 
-                    if frame_avg_brightness < 80:
-                        score = brightness * 0.4 + contrast * 0.6
-                        if brightness > 150 and contrast > 50:
-                            score += 50
-                    else:
-                        score = brightness * 0.7 + contrast * 0.3
+                context = "black_region" if black_mask is not None and black_mask[min(max(y, 0), h - 1), min(max(x, 0), w - 1)] > 0 else "default"
+                metrics = self.evaluate_circle_candidate(frame, gray, x, y, r, context=context)
+                if metrics is None:
+                    continue
 
-                    if score > max_brightness:
-                        max_brightness = score
-                        best_circle = (x, y, r)
-            
-            # 更新最后检测到的位置
+                brightness = metrics["mean"]
+                contrast = metrics["contrast"]
+
+                if frame_avg_brightness < 80:
+                    score = brightness * 0.4 + contrast * 0.6
+                    if brightness > 150 and contrast > 50:
+                        score += 50
+                else:
+                    score = brightness * 0.7 + contrast * 0.3
+
+                if score > max_score:
+                    max_score = score
+                    best_circle = (x, y, r)
+
             if best_circle is not None:
                 self.last_gaze_position = (best_circle[0], best_circle[1])
-            
-            return best_circle, black_mask
-        
+                return best_circle, black_mask
+
         return None, black_mask
     
     def is_steering_wheel_button(self, gray, x, y, r):
@@ -171,13 +199,13 @@ class GazeAnalyzer:
         )
         
         return is_steering_wheel
-    
-    def evaluate_circle_candidate(self, frame, gray, x, y, r):
-        """Compute metrics for a detected circle and filter out open rings or noisy blobs."""
+    def evaluate_circle_candidate(self, frame, gray, x, y, r, context="default"):
+        """Compute metrics for a circle candidate"""
         h, w = gray.shape
         radius = int(max(2, round(r)))
         if radius <= 1:
             return None
+
         pad = max(radius + 2, int(radius * 1.5))
         x1 = max(0, x - pad)
         y1 = max(0, y - pad)
@@ -186,50 +214,85 @@ class GazeAnalyzer:
         roi_gray = gray[y1:y2, x1:x2]
         if roi_gray.size == 0:
             return None
+
         center = (x - x1, y - y1)
+        context = context or "default"
+
+        if context == "black_region":
+            fill_ratio_factor = 0.35
+            min_fill_ratio = max(0.4, self.min_circle_fill_ratio - 0.1)
+            max_std_ratio = self.max_circle_std_ratio + 0.2
+            ring_gap_limit = self.max_ring_intensity_gap + 8
+            min_perimeter_ratio = max(0.55, self.min_perimeter_brightness_ratio - 0.15)
+            color_std_limit = self.max_color_std_for_circle + 15
+            min_mean_intensity = 85
+            perimeter_std_limit = self.max_perimeter_radius_std * 1.35
+            eccentricity_limit = self.max_eccentricity_ratio + 0.4
+        else:
+            fill_ratio_factor = 0.45
+            min_fill_ratio = self.min_circle_fill_ratio
+            max_std_ratio = self.max_circle_std_ratio
+            ring_gap_limit = self.max_ring_intensity_gap
+            min_perimeter_ratio = self.min_perimeter_brightness_ratio
+            color_std_limit = self.max_color_std_for_circle
+            min_mean_intensity = 90
+            perimeter_std_limit = self.max_perimeter_radius_std
+            eccentricity_limit = self.max_eccentricity_ratio
+
         mask = np.zeros_like(roi_gray, dtype=np.uint8)
         cv2.circle(mask, center, radius, 255, -1)
         circle_pixels = roi_gray[mask == 255]
-        min_pixels = max(10, int(np.pi * radius * radius * 0.45))
+        min_pixels = max(8, int(np.pi * radius * radius * fill_ratio_factor))
         if circle_pixels.size < min_pixels:
             return None
+
         circle_pixels = circle_pixels.astype(np.float32)
         mean_intensity = float(np.mean(circle_pixels))
-        if mean_intensity < 90:
+        if mean_intensity < min_mean_intensity:
             return None
+
         std_intensity = float(np.std(circle_pixels))
         std_ratio = std_intensity / (mean_intensity + 1e-6)
+
         inner_r = max(1, int(radius * 0.55))
         inner_mask = np.zeros_like(mask, dtype=np.uint8)
         cv2.circle(inner_mask, center, inner_r, 255, -1)
         inner_pixels = roi_gray[inner_mask == 255]
         inner_mean = float(np.mean(inner_pixels)) if inner_pixels.size > 0 else mean_intensity
+
         ring_mask = np.zeros_like(mask, dtype=np.uint8)
         cv2.circle(ring_mask, center, radius, 255, -1)
         ring_inner_r = max(inner_r, int(radius * 0.75))
         cv2.circle(ring_mask, center, ring_inner_r, 0, -1)
         ring_pixels = roi_gray[ring_mask == 255]
         ring_mean = float(np.mean(ring_pixels)) if ring_pixels.size > 0 else mean_intensity
+
         _, binary = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         fill_pixels = int(np.sum((binary == 255) & (mask == 255)))
-        fill_ratio = fill_pixels / circle_pixels.size
+        fill_ratio = fill_pixels / max(1, circle_pixels.size)
+
         perimeter_mask = np.zeros_like(mask, dtype=np.uint8)
         cv2.circle(perimeter_mask, center, radius, 255, 1)
         perimeter_pixels = roi_gray[perimeter_mask == 255].astype(np.float32)
-        perimeter_threshold = mean_intensity - 12.0
-        if perimeter_pixels.size > 0:
-            perimeter_ratio = float(np.mean(perimeter_pixels > perimeter_threshold))
+        perimeter_threshold = mean_intensity - (10.0 if context == "black_region" else 12.0)
+        perimeter_ratio = float(np.mean(perimeter_pixels > perimeter_threshold)) if perimeter_pixels.size > 0 else 1.0
+
+        perimeter_coords = np.column_stack(np.where(perimeter_mask == 255))
+        if perimeter_coords.size > 0:
+            dy = perimeter_coords[:, 0].astype(np.float32) - center[1]
+            dx = perimeter_coords[:, 1].astype(np.float32) - center[0]
+            distances = np.sqrt(dx * dx + dy * dy)
+            perimeter_std = float(np.std(distances)) / (radius + 1e-6)
         else:
-            perimeter_ratio = 1.0
+            perimeter_std = 0.0
+
         surround_x1 = max(0, x - radius * 2)
         surround_y1 = max(0, y - radius * 2)
         surround_x2 = min(w, x + radius * 2 + 1)
         surround_y2 = min(h, y + radius * 2 + 1)
         surrounding_roi = gray[surround_y1:surround_y2, surround_x1:surround_x2]
-        if surrounding_roi.size > 0:
-            contrast = mean_intensity - float(np.mean(surrounding_roi))
-        else:
-            contrast = 0.0
+        contrast = float(mean_intensity - np.mean(surrounding_roi)) if surrounding_roi.size > 0 else 0.0
+
         color_std = None
         if frame is not None:
             roi_color = frame[y1:y2, x1:x2]
@@ -237,17 +300,41 @@ class GazeAnalyzer:
                 circle_colors = roi_color[mask == 255].astype(np.float32)
                 if circle_colors.size > 0:
                     color_std = float(np.mean(np.std(circle_colors, axis=0)))
+
         ring_gap = ring_mean - inner_mean
-        if fill_ratio < self.min_circle_fill_ratio:
+
+        if fill_ratio < min_fill_ratio:
+            if not (context == "black_region" and fill_ratio > min_fill_ratio - 0.08 and mean_intensity > 150):
+                return None
+
+        if perimeter_ratio < min_perimeter_ratio:
             return None
-        if perimeter_ratio < self.min_perimeter_brightness_ratio:
+
+        if perimeter_std > perimeter_std_limit:
             return None
-        if ring_gap > self.max_ring_intensity_gap and inner_mean < 175:
+
+        if ring_gap > ring_gap_limit and inner_mean < 180:
             return None
-        if std_ratio > self.max_circle_std_ratio and fill_ratio < 0.85:
+
+        if std_ratio > max_std_ratio and fill_ratio < 0.9:
             return None
-        if color_std is not None and color_std > self.max_color_std_for_circle and fill_ratio < 0.8:
+
+        if color_std is not None and color_std > color_std_limit and fill_ratio < 0.85:
             return None
+
+        coords = np.column_stack(np.where((binary == 255) & (mask == 255)))
+        if coords.size > 1:
+            rel_y = coords[:, 0].astype(np.float32) - center[1]
+            rel_x = coords[:, 1].astype(np.float32) - center[0]
+            cov = np.cov(np.stack([rel_x, rel_y]))
+            eigen_vals = np.linalg.eigvalsh(cov + 1e-6 * np.eye(2))
+            ecc_ratio = float(eigen_vals.max() / (eigen_vals.min() + 1e-6))
+        else:
+            ecc_ratio = 1.0
+
+        if ecc_ratio > eccentricity_limit:
+            return None
+
         return {
             "mean": mean_intensity,
             "contrast": contrast,
@@ -255,13 +342,14 @@ class GazeAnalyzer:
             "std_ratio": std_ratio,
             "ring_diff": ring_gap,
             "perimeter_ratio": perimeter_ratio,
+            "perimeter_std": perimeter_std,
             "color_std": color_std,
             "inner_mean": inner_mean,
             "ring_mean": ring_mean,
+            "eccentricity": ecc_ratio,
         }
-
-    def detect_with_proximity_priority(self, frame, gray, left_exclude, right_exclude, top_exclude):
-        """近处优先检测：在上一帧位置周围逐步扩大搜索范围"""
+    def detect_with_proximity_priority(self, frame, gray, left_exclude, right_exclude, top_exclude, black_mask=None):
+        """Prioritize search near the last gaze position"""
         if self.last_gaze_position is None:
             return None
 
@@ -290,61 +378,83 @@ class GazeAnalyzer:
                 maxRadius=12
             )
 
-            if circles is not None:
-                circles = np.round(circles[0, :]).astype("int")
+            if circles is None:
+                continue
 
-                best_circle = None
-                min_distance = float('inf')
+            circles = np.round(circles[0, :]).astype("int")
 
-                for (rel_x, rel_y, r) in circles:
-                    abs_x = rel_x + search_x1
-                    abs_y = rel_y + search_y1
+            best_circle = None
+            min_distance = float('inf')
 
-                    if not (left_exclude <= abs_x <= right_exclude and abs_y >= top_exclude):
-                        continue
+            for (rel_x, rel_y, r) in circles:
+                abs_x = rel_x + search_x1
+                abs_y = rel_y + search_y1
 
-                    if self.is_steering_wheel_button(gray, abs_x, abs_y, r):
-                        continue
+                if not (left_exclude <= abs_x <= right_exclude and abs_y >= top_exclude):
+                    continue
 
-                    metrics = self.evaluate_circle_candidate(frame, gray, abs_x, abs_y, r)
-                    if metrics is None:
-                        continue
+                if self.is_steering_wheel_button(gray, abs_x, abs_y, r):
+                    continue
 
-                    distance = ((abs_x - last_x) ** 2 + (abs_y - last_y) ** 2) ** 0.5
+                if black_mask is not None:
+                    mask_y = int(np.clip(abs_y, 0, h - 1))
+                    mask_x = int(np.clip(abs_x, 0, w - 1))
+                    context = "black_region" if black_mask[mask_y, mask_x] > 0 else "default"
+                else:
+                    context = "default"
 
-                    if metrics["mean"] > 100 and distance < min_distance:
-                        min_distance = distance
-                        best_circle = (abs_x, abs_y, r)
+                metrics = self.evaluate_circle_candidate(frame, gray, abs_x, abs_y, r, context=context)
+                if metrics is None:
+                    continue
 
-                if best_circle is not None:
-                    return best_circle
+                distance = ((abs_x - last_x) ** 2 + (abs_y - last_y) ** 2) ** 0.5
+
+                if metrics["mean"] > 100 and distance < min_distance:
+                    min_distance = distance
+                    best_circle = (abs_x, abs_y, r)
+
+            if best_circle is not None:
+                return best_circle
 
         return None
-
     def create_black_region_mask(self, gray):
-        """创建黑色区域的mask"""
-        # 使用自适应阈值检测黑色区域
-        binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                      cv2.THRESH_BINARY_INV, 15, 10)
-        
-        # 形态学处理，连接黑色区域
-        kernel = np.ones((5,5), np.uint8)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-        
-        # 找到最大的黑色区域
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            # 选择面积最大的轮廓
-            largest_contour = max(contours, key=cv2.contourArea)
-            mask = np.zeros_like(gray)
-            cv2.fillPoly(mask, [largest_contour], 255)
-            return mask
-        
-        return np.zeros_like(gray)
-    
+        """Build mask of dark regions"""
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        adaptive = cv2.adaptiveThreshold(
+            blurred,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            21,
+            7
+        )
+        _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        range_mask = cv2.inRange(blurred, 0, min(255, self.black_threshold + 30))
+
+        combined = cv2.bitwise_or(adaptive, otsu)
+        combined = cv2.bitwise_or(combined, range_mask)
+
+        kernel = np.ones((5, 5), np.uint8)
+        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=2)
+        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        mask = np.zeros_like(gray)
+        area_threshold = max(200, int(gray.shape[0] * gray.shape[1] * 0.001))
+
+        found = False
+        for contour in contours:
+            if cv2.contourArea(contour) >= area_threshold:
+                cv2.fillPoly(mask, [contour], 255)
+                found = True
+
+        if not found:
+            mask = combined
+
+        return mask
     def detect_in_black_region(self, frame, gray, black_mask, left_exclude, right_exclude, top_exclude):
-        """在黑色区域内用高敏感度检测白点"""
+        """Detect bright dots inside dark regions"""
         if black_mask is None:
             return None
 
@@ -371,23 +481,25 @@ class GazeAnalyzer:
             if not (left_exclude <= x <= right_exclude and y >= top_exclude):
                 continue
 
-            if black_mask[y, x] == 0:
+            mask_y = int(np.clip(y, 0, gray.shape[0] - 1))
+            mask_x = int(np.clip(x, 0, gray.shape[1] - 1))
+            if black_mask[mask_y, mask_x] == 0:
                 continue
 
             if self.is_steering_wheel_button(gray, x, y, r):
                 continue
 
-            metrics = self.evaluate_circle_candidate(frame, gray, x, y, r)
+            metrics = self.evaluate_circle_candidate(frame, gray, x, y, r, context="black_region")
             if metrics is None:
                 continue
 
             brightness = metrics["mean"]
             contrast = metrics["contrast"]
 
-            if brightness < 120:
+            if brightness < 110:
                 continue
 
-            score = brightness + contrast * 2.0
+            score = brightness * 0.6 + contrast * 2.4
 
             if score > max_score:
                 max_score = score
@@ -451,55 +563,82 @@ class GazeAnalyzer:
         text_x = x + (w - text_size[0]) // 2
         text_y = y + (h + text_size[1]) // 2
         cv2.putText(frame, text, (text_x, text_y), font, 0.6, (255, 255, 255), 2)
-    
-    def draw_mask_indicator(self, frame, black_mask):
-        """在左下角显示黑色区域mask的缩略图"""
+    def draw_mask_indicator(self, frame, source_frame, black_mask):
+        """Render frame/mask comparison thumbnail"""
         h, w = frame.shape[:2]
-        
-        # 缩略图大小
-        thumb_w, thumb_h = 120, 80
-        thumb_x = 20
-        thumb_y = h - thumb_h - 20
-        
-        # 缩放mask到缩略图大小
+
+        thumb_w = max(60, min(120, w // 10))
+        thumb_h = max(45, min(90, int(thumb_w * 0.75)))
+
         mask_resized = cv2.resize(black_mask, (thumb_w, thumb_h))
-        
-        # 创建彩色版本的mask (白色区域显示为绿色)
-        # 将mask转换为3通道，白色区域显示为绿色
-        mask_colored = np.zeros((thumb_h, thumb_w, 3), dtype=np.uint8)
-        mask_colored[:, :, 1] = mask_resized  # 绿色通道
-        
-        # 在原图上叠加缩略图
-        frame[thumb_y:thumb_y+thumb_h, thumb_x:thumb_x+thumb_w] = mask_colored
-        
-        # 绘制边框
-        cv2.rectangle(frame, (thumb_x, thumb_y), (thumb_x+thumb_w, thumb_y+thumb_h), (255, 255, 255), 2)
-        
-        # 添加标签
+        frame_resized = cv2.resize(source_frame, (thumb_w, thumb_h))
+
+        mask_overlay = cv2.merge([
+            np.zeros_like(mask_resized),
+            mask_resized,
+            np.zeros_like(mask_resized)
+        ])
+        overlay = cv2.addWeighted(frame_resized, 0.65, mask_overlay, 0.35, 0)
+        mask_colored = cv2.cvtColor(mask_resized, cv2.COLOR_GRAY2BGR)
+
+        combined = np.hstack([frame_resized, overlay, mask_colored])
+        total_w = combined.shape[1]
+
+        thumb_x = 20
+        if thumb_x + total_w > w - 10:
+            thumb_x = max(10, w - total_w - 10)
+        thumb_y = h - thumb_h - 20
+
+        if thumb_y < 0 or thumb_x < 0:
+            return
+
+        frame[thumb_y:thumb_y + thumb_h, thumb_x:thumb_x + total_w] = combined
+
+        cv2.rectangle(frame, (thumb_x, thumb_y), (thumb_x + total_w, thumb_y + thumb_h), (255, 255, 255), 1)
         font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(frame, 'Black Mask', (thumb_x, thumb_y-5), font, 0.4, (255, 255, 255), 1)
-    
-    def update_state(self, new_state, frame_num, fps):
-        """更新状态并记录片段"""
-        if new_state != self.current_state:
-            # 状态改变，记录上一个片段
-            if self.current_state is not None and frame_num - self.state_start_frame >= self.min_duration:
-                duration_frames = frame_num - self.state_start_frame
+        cv2.putText(frame, 'Frame | Overlay | Mask', (thumb_x, thumb_y - 5), font, 0.4, (255, 255, 255), 1)
+    def update_state(self, raw_state, frame_num, fps):
+        """Update stable state with hysteresis"""
+        if raw_state == 'unknown':
+            raw_state = self.current_state if self.current_state is not None else 'virtual'
+
+        if self.current_state is None:
+            self.current_state = raw_state
+            self.state_start_frame = frame_num
+            self.pending_state = None
+            self.pending_start_frame = frame_num
+            return
+
+        if raw_state == self.current_state:
+            self.pending_state = None
+            return
+
+        if self.pending_state != raw_state:
+            self.pending_state = raw_state
+            self.pending_start_frame = frame_num
+            return
+
+        if frame_num - self.pending_start_frame + 1 < self.transition_hold_frames:
+            return
+
+        transition_frame = self.pending_start_frame
+        if transition_frame > self.state_start_frame:
+            duration_frames = transition_frame - self.state_start_frame
+            if duration_frames >= self.min_duration:
                 duration_seconds = duration_frames / fps
-                
                 self.segments.append({
                     'state': self.current_state,
                     'start_frame': self.state_start_frame,
-                    'end_frame': frame_num - 1,
+                    'end_frame': transition_frame - 1,
                     'duration_frames': duration_frames,
                     'duration_seconds': duration_seconds,
                     'start_time': self.state_start_frame / fps,
-                    'end_time': (frame_num - 1) / fps
+                    'end_time': (transition_frame - 1) / fps
                 })
-            
-            # 开始新状态
-            self.current_state = new_state
-            self.state_start_frame = frame_num
+
+        self.current_state = self.pending_state
+        self.state_start_frame = transition_frame
+        self.pending_state = None
     
     def finalize_segments(self, total_frames, fps):
         """完成最后一个片段的记录"""
@@ -516,121 +655,105 @@ class GazeAnalyzer:
                 'start_time': self.state_start_frame / fps,
                 'end_time': (total_frames - 1) / fps
             })
-    
+
     def analyze_video(self, video_path, output_dir=None, show_preview=True):
-        """分析视频文件"""
-        print(f"🎬 开始分析视频: {os.path.basename(video_path)}")
-        
+        """Analyze a single video"""
+        print(f"🎬 开始分析: {os.path.basename(video_path)}")
+
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             print(f"❌ 无法打开视频文件: {video_path}")
             return None
-        
-        # 获取视频信息
+
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
+
         print(f"📊 视频信息: {width}x{height}, {fps:.2f}fps, {total_frames}帧")
-        
-        # 重置状态
+
         self.segments = []
         self.current_state = None
-        
+        self.pending_state = None
+        self.pending_start_frame = 0
+        self.last_gaze_position = None
+
         frame_num = 0
-        
-        # 如果需要保存处理后的视频
+
         output_video = None
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
             output_video_path = os.path.join(output_dir, f"{os.path.splitext(os.path.basename(video_path))[0]}_analyzed.mp4")
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             output_video = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
-        
+
         try:
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
-                
-                # 检测视线点
+                raw_frame_for_mask = frame.copy()
+
                 detection_result = self.detect_gaze_circle(frame)
-                
-                current_state = 'unknown'
+
+                raw_state = 'virtual'
                 gaze_circle = None
                 black_mask = None
-                
+
                 if detection_result and len(detection_result) == 2:
                     gaze_circle, black_mask = detection_result
-                
+
                 if gaze_circle:
                     gaze_x, gaze_y, radius = gaze_circle
-                    
-                    # 分析视线区域
-                    current_state = self.analyze_gaze_region(frame, gaze_x, gaze_y)
-                    
-                    # 在视线点绘制圆圈（用于调试）
+                    raw_state = self.analyze_gaze_region(frame, gaze_x, gaze_y)
                     cv2.circle(frame, (gaze_x, gaze_y), radius, (255, 255, 0), 2)
                     cv2.circle(frame, (gaze_x, gaze_y), self.detection_radius, (0, 255, 255), 1)
                 else:
-                    # 反向逻辑：如果黑色区域内没有检测到白圈，判断为现实世界
-                    if black_mask is not None and np.sum(black_mask) > 1000:  # 确保有足够大的黑色区域
-                        current_state = 'reality'
-                
-                # 更新状态
-                self.update_state(current_state, frame_num, fps)
-                
-                # 绘制状态指示器
-                self.draw_indicator(frame, current_state)
-                
-                # 在左下角显示黑色区域mask
+                    if black_mask is not None and np.sum(black_mask) > 1000:
+                        raw_state = 'reality'
+
+                self.update_state(raw_state, frame_num, fps)
+                stable_state = self.current_state if self.current_state is not None else raw_state
+
+                self.draw_indicator(frame, stable_state)
+
                 if black_mask is not None:
-                    self.draw_mask_indicator(frame, black_mask)
-                
-                # 显示进度
-                if frame_num % 100 == 0:
+                    self.draw_mask_indicator(frame, raw_frame_for_mask, black_mask)
+
+                if frame_num % 100 == 0 and total_frames > 0:
                     progress = (frame_num / total_frames) * 100
                     print(f"⏳ 处理进度: {progress:.1f}% ({frame_num}/{total_frames})")
-                
-                # 保存处理后的帧
+
                 if output_video:
                     output_video.write(frame)
-                
-                # 实时预览
+
                 if show_preview:
-                    # 缩放显示（如果视频太大）
                     display_frame = frame
                     if width > 1280:
                         scale = 1280 / width
-                        new_width = int(width * scale)
-                        new_height = int(height * scale)
-                        display_frame = cv2.resize(frame, (new_width, new_height))
-                    
+                        display_frame = cv2.resize(frame, (int(width * scale), int(height * scale)))
+
                     cv2.imshow('Gaze Analysis', display_frame)
-                    
-                    # 按ESC退出预览
+
                     if cv2.waitKey(1) & 0xFF == 27:
                         print("⏹️  用户中断预览")
                         break
-                
+
                 frame_num += 1
-            
+
         finally:
             cap.release()
             if output_video:
                 output_video.release()
             if show_preview:
                 cv2.destroyAllWindows()
-        
-        # 完成最后一个片段
+
         self.finalize_segments(frame_num, fps)
-        
+
         print(f"✅ 分析完成! 共处理 {frame_num} 帧")
-        
-        # 生成统计报告
+
         self.generate_report(video_path, output_dir)
-        
+
         return self.segments
     
     def generate_report(self, video_path, output_dir):
@@ -692,77 +815,74 @@ def get_video_files(directory):
     return sorted(video_files)
 
 def main():
-    parser = argparse.ArgumentParser(description="VR眼动数据自动分析工具")
-    parser.add_argument("--input", "-i", default="眼动数据", help="输入目录（默认：眼动数据）")
-    parser.add_argument("--output", "-o", default="analysis_results", help="输出目录（默认：analysis_results）")
+    parser = argparse.ArgumentParser(description="VR gaze analyzer")
+    parser.add_argument("--input", "-i", default="眼动数据", help="输入目录 (默认: 眼动数据)")
+    parser.add_argument("--output", "-o", default="analysis_results", help="输出目录 (默认: analysis_results)")
     parser.add_argument("--no-preview", action="store_true", help="不显示实时预览")
-    parser.add_argument("--black-threshold", type=int, default=30, help="黑色检测阈值（默认：30）")
-    parser.add_argument("--radius", type=int, default=20, help="检测半径（默认：20）")
-    
+    parser.add_argument("--black-threshold", type=int, default=30, help="黑色检测阈值 (默认: 30)")
+    parser.add_argument("--radius", type=int, default=20, help="检测半径 (默认: 20)")
+    parser.add_argument("--model", type=str, help="加载训练阈值配置 JSON")
+
     args = parser.parse_args()
-    
+
     print("🎯 VR眼动数据自动分析工具")
     print("=" * 50)
-    
-    # 检查输入目录
+
     if not os.path.exists(args.input):
-        print(f"❌ 输入目录不存在: {args.input}")
+        print(f"[ERROR] 输入目录不存在: {args.input}")
         return
-    
-    # 获取视频文件
+
     video_files = get_video_files(args.input)
-    
     if not video_files:
-        print(f"❌ 在 {args.input} 中没有找到视频文件")
+        print(f"[WARN] {args.input} 中没有找到视频文件")
         return
-    
+
     print(f"📁 找到 {len(video_files)} 个视频文件")
-    
-    # 创建分析器
+
     analyzer = GazeAnalyzer()
     analyzer.black_threshold = args.black_threshold
     analyzer.detection_radius = args.radius
-    
-    # 显示文件列表并让用户选择
+    if args.model:
+        analyzer.load_model(args.model)
+
     print("\n视频文件列表:")
     for i, video_file in enumerate(video_files, 1):
         rel_path = os.path.relpath(video_file, args.input)
         print(f"{i:2d}. {rel_path}")
-    
+
     try:
-        choice = input(f"\n请选择要分析的视频 (1-{len(video_files)}, 或 'all' 分析所有): ").strip()
-        
-        if choice.lower() == 'all':
+        choice = input(f"\n请选择要分析的视频 (1-{len(video_files)}, 或输入 'all' 分析全部): ").strip()
+
+        if choice.lower() == "all":
             selected_files = video_files
         else:
             choice_num = int(choice)
             if 1 <= choice_num <= len(video_files):
                 selected_files = [video_files[choice_num - 1]]
             else:
-                print("❌ 无效选择")
+                print("[ERROR] 无效选择")
                 return
-        
-        # 分析选定的视频
+
         for video_file in selected_files:
-            print(f"\n🚀 开始分析: {os.path.basename(video_file)}")
-            
+            print(f"\n🚀 开始分析 {os.path.basename(video_file)}")
             segments = analyzer.analyze_video(
-                video_file, 
-                args.output, 
+                video_file,
+                args.output,
                 show_preview=not args.no_preview
             )
-            
+
             if segments:
-                print(f"✅ 分析完成，共检测到 {len(segments)} 个片段")
+                print(f"[DONE] 检测到 {len(segments)} 个片段")
             else:
-                print("❌ 分析失败")
-    
+                print("[WARN] 未检测到有效片段")
+
     except KeyboardInterrupt:
-        print("\n⏹️  用户中断")
+        print("\n[INFO] 用户中断")
     except ValueError:
-        print("❌ 请输入有效的数字")
-    except Exception as e:
-        print(f"❌ 错误: {e}")
+        print("[ERROR] 请输入有效数字")
+    except Exception as exc:
+        print(f"[ERROR] 分析失败: {exc}")
+
 
 if __name__ == "__main__":
     main()
