@@ -25,7 +25,13 @@ class GazeAnalyzer:
     def __init__(self):
         # 检测参数
         self.black_threshold = 30  # 黑色阈值（0-255）
+        self.pure_black_threshold = 15  # pure-black threshold for strict screen region detection
         self.detection_radius = 20  # 视线点周围检测半径
+        self.reality_mask_min_coverage = 0.4  # minimum mask coverage required to consider reality
+        self.reality_black_ratio_threshold = 0.55  # minimum proportion of dark pixels in ROI
+        self.reality_brightness_scale = 0.9  # scale factor for black-threshold brightness check
+        self.manual_tolerance_px = 8  # pixel tolerance when reconciling manual adjustments
+        self.side_ui_exclusion_ratio = 0.12  # portion of frame width to ignore for side UI panels
         self.min_duration = 5  # 最小持续帧数（避免噪声）
         
         # 显示参数
@@ -77,7 +83,10 @@ class GazeAnalyzer:
             'max_color_std_for_circle': 'max_color_std_for_circle',
             'max_perimeter_radius_std': 'max_perimeter_radius_std',
             'max_eccentricity_ratio': 'max_eccentricity_ratio',
-            'transition_hold_frames': 'transition_hold_frames'
+            'transition_hold_frames': 'transition_hold_frames',
+            'reality_mask_min_coverage': 'reality_mask_min_coverage',
+            'reality_black_ratio_threshold': 'reality_black_ratio_threshold',
+            'reality_brightness_scale': 'reality_brightness_scale'
         }
 
         for key, attr in mapping.items():
@@ -417,9 +426,77 @@ class GazeAnalyzer:
                 return best_circle
 
         return None
-    def create_black_region_mask(self, gray):
-        """Build mask of dark regions"""
+
+    def _refine_mask(self, mask, kernel_size=5, close_iters=1, open_iters=1):
+        """Apply simple morphology to clean binary masks."""
+        if mask is None:
+            return None
+        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        if close_iters > 0:
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=close_iters)
+        if open_iters > 0:
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=open_iters)
+        return mask
+
+    def _apply_side_exclusion(self, mask):
+        """Zero-out side UI panels based on configured ratio."""
+        if mask is None:
+            return None
+        h, w = mask.shape[:2]
+        margin = int(round(w * self.side_ui_exclusion_ratio))
+        if margin <= 0:
+            return mask
+        mask = mask.copy()
+        mask[:, :margin] = 0
+        mask[:, w - margin:] = 0
+        return mask
+
+    def _bridge_linear_gaps(self, mask, gap_ratio=0.02, orientation='vertical'):
+        """Fill narrow bright streaks that cut through dark regions."""
+        if mask is None:
+            return None
+        h, w = mask.shape[:2]
+        if orientation == 'vertical':
+            kernel_width = max(3, int(w * gap_ratio))
+            if kernel_width % 2 == 0:
+                kernel_width += 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, 1))
+        else:
+            kernel_height = max(3, int(h * gap_ratio))
+            if kernel_height % 2 == 0:
+                kernel_height += 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_height))
+        return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    def create_pure_black_mask(self, gray):
+        """Return a mask of near-zero-intensity pixels (pure black)."""
+        if gray is None:
+            return None
+        if len(gray.shape) == 3:
+            gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        threshold = max(0, min(self.pure_black_threshold, self.black_threshold))
+        mask = cv2.inRange(blurred, 0, threshold)
+        mask = self._refine_mask(mask, kernel_size=3, close_iters=2, open_iters=1)
+        if mask is None:
+            return None
+        if cv2.countNonZero(mask) == 0:
+            return mask
+        mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+        mask = self._bridge_linear_gaps(mask, gap_ratio=0.015, orientation='vertical')
+        mask = self._apply_side_exclusion(mask)
+        return mask
+
+    def create_black_region_mask(self, gray):
+        """Build mask of dark regions, prioritising pure-black areas."""
+        if gray is None:
+            return None
+        if len(gray.shape) == 3:
+            gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        area_threshold = max(200, int(gray.shape[0] * gray.shape[1] * 0.001))
+        pure_mask = self.create_pure_black_mask(gray)
+        pure_area = cv2.countNonZero(pure_mask) if pure_mask is not None else 0
 
         adaptive = cv2.adaptiveThreshold(
             blurred,
@@ -430,29 +507,38 @@ class GazeAnalyzer:
             7
         )
         _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        range_mask = cv2.inRange(blurred, 0, min(255, self.black_threshold + 30))
+        range_mask = cv2.inRange(blurred, 0, self.black_threshold)
 
         combined = cv2.bitwise_or(adaptive, otsu)
-        combined = cv2.bitwise_or(combined, range_mask)
+        combined = cv2.bitwise_and(combined, range_mask)
+        combined = self._refine_mask(combined, kernel_size=5, close_iters=2, open_iters=1)
+        combined = self._apply_side_exclusion(combined)
 
-        kernel = np.ones((5, 5), np.uint8)
-        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=2)
-        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel, iterations=1)
-
-        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         mask = np.zeros_like(gray)
-        area_threshold = max(200, int(gray.shape[0] * gray.shape[1] * 0.001))
-
-        found = False
+        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for contour in contours:
-            if cv2.contourArea(contour) >= area_threshold:
-                cv2.fillPoly(mask, [contour], 255)
-                found = True
+            if cv2.contourArea(contour) < area_threshold:
+                continue
+            component_mask = np.zeros_like(gray)
+            cv2.drawContours(component_mask, [contour], -1, 255, -1)
+            mean_intensity = cv2.mean(blurred, mask=component_mask)[0]
+            if mean_intensity <= self.black_threshold:
+                cv2.drawContours(mask, [contour], -1, 255, -1)
 
-        if not found:
+        if pure_area > 0 and pure_mask is not None:
+            mask = cv2.bitwise_or(mask, pure_mask)
+            mask = self._refine_mask(mask, kernel_size=5, close_iters=1, open_iters=1)
+
+        final_area = cv2.countNonZero(mask)
+        if final_area < area_threshold and pure_area >= area_threshold:
+            mask = pure_mask
+        elif final_area == 0:
             mask = combined
 
+        mask = self._bridge_linear_gaps(mask, gap_ratio=0.015, orientation='vertical')
+        mask = self._apply_side_exclusion(mask)
         return mask
+
     def detect_in_black_region(self, frame, gray, black_mask, left_exclude, right_exclude, top_exclude):
         """Detect bright dots inside dark regions"""
         if black_mask is None:
@@ -507,37 +593,57 @@ class GazeAnalyzer:
 
         return best_circle
 
-    def analyze_gaze_region(self, frame, gaze_x, gaze_y):
-        """分析视线点周围区域判断是现实还是虚拟"""
+    def analyze_gaze_region(self, frame, gaze_x, gaze_y, black_mask=None, pure_mask=None):
+        """Classify gaze region with strict black-mask requirements"""
         h, w = frame.shape[:2]
-        
-        # 确保检测区域在图像范围内
+
         x1 = max(0, gaze_x - self.detection_radius)
         y1 = max(0, gaze_y - self.detection_radius)
         x2 = min(w, gaze_x + self.detection_radius)
         y2 = min(h, gaze_y + self.detection_radius)
-        
-        # 提取检测区域
+
         roi = frame[y1:y2, x1:x2]
-        
         if roi.size == 0:
-            return 'unknown'
-        
-        # 转换为灰度并计算平均亮度
+            return 'virtual'
+
+        mask_y = int(np.clip(gaze_y, 0, h - 1))
+        mask_x = int(np.clip(gaze_x, 0, w - 1))
+
+        in_pure = False
+        in_black = False
+        if pure_mask is not None and pure_mask.shape[:2] == (h, w):
+            in_pure = pure_mask[mask_y, mask_x] > 0
+        if black_mask is not None and black_mask.shape[:2] == (h, w):
+            in_black = black_mask[mask_y, mask_x] > 0
+
+        if not (in_pure or in_black):
+            return 'virtual'
+
         gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        avg_brightness = np.mean(gray_roi)
-        
-        # 计算黑色像素比例
+        avg_brightness = float(np.mean(gray_roi))
         black_pixels = np.sum(gray_roi < self.black_threshold)
         total_pixels = gray_roi.size
-        black_ratio = black_pixels / total_pixels
-        
-        # 判断逻辑：如果黑色像素比例超过50%或平均亮度很低，认为是现实世界
-        if black_ratio > 0.5 or avg_brightness < self.black_threshold:
-            return 'reality'
-        else:
+        black_ratio = (black_pixels / total_pixels) if total_pixels else 0.0
+
+        coverage = 0.0
+        if black_mask is not None and black_mask.shape[:2] == (h, w):
+            mask_roi = black_mask[y1:y2, x1:x2]
+            if mask_roi.size:
+                coverage = max(coverage, float(np.mean(mask_roi > 0)))
+        if pure_mask is not None and pure_mask.shape[:2] == (h, w):
+            pure_roi = pure_mask[y1:y2, x1:x2]
+            if pure_roi.size:
+                coverage = max(coverage, float(np.mean(pure_roi > 0)))
+
+        if coverage < self.reality_mask_min_coverage:
             return 'virtual'
-    
+
+        brightness_threshold = self.black_threshold * self.reality_brightness_scale
+        if black_ratio >= self.reality_black_ratio_threshold or avg_brightness <= brightness_threshold:
+            return 'reality'
+
+        return 'virtual'
+
     def draw_indicator(self, frame, state):
         """在左上角绘制状态指示器"""
         x, y = self.indicator_pos
@@ -693,6 +799,8 @@ class GazeAnalyzer:
                 if not ret:
                     break
                 raw_frame_for_mask = frame.copy()
+                gray_frame = cv2.cvtColor(raw_frame_for_mask, cv2.COLOR_BGR2GRAY)
+                pure_black_mask = self.create_pure_black_mask(gray_frame)
 
                 detection_result = self.detect_gaze_circle(frame)
 
@@ -705,20 +813,24 @@ class GazeAnalyzer:
 
                 if gaze_circle:
                     gaze_x, gaze_y, radius = gaze_circle
-                    raw_state = self.analyze_gaze_region(frame, gaze_x, gaze_y)
+                    raw_state = self.analyze_gaze_region(
+                        frame,
+                        gaze_x,
+                        gaze_y,
+                        black_mask=black_mask,
+                        pure_mask=pure_black_mask
+                    )
                     cv2.circle(frame, (gaze_x, gaze_y), radius, (255, 255, 0), 2)
                     cv2.circle(frame, (gaze_x, gaze_y), self.detection_radius, (0, 255, 255), 1)
-                else:
-                    if black_mask is not None and np.sum(black_mask) > 1000:
-                        raw_state = 'reality'
 
                 self.update_state(raw_state, frame_num, fps)
                 stable_state = self.current_state if self.current_state is not None else raw_state
 
                 self.draw_indicator(frame, stable_state)
 
-                if black_mask is not None:
-                    self.draw_mask_indicator(frame, raw_frame_for_mask, black_mask)
+                mask_for_overlay = black_mask if black_mask is not None else pure_black_mask
+                if mask_for_overlay is not None:
+                    self.draw_mask_indicator(frame, raw_frame_for_mask, mask_for_overlay)
 
                 if frame_num % 100 == 0 and total_frames > 0:
                     progress = (frame_num / total_frames) * 100
