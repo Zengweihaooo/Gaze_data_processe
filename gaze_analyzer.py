@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 import os
 import pandas as pd
-from collections import defaultdict, Counter, deque
+from collections import defaultdict, deque, Counter, deque
 import argparse
 import json
 import glob
@@ -42,6 +42,12 @@ class GazeAnalyzer:
         # 近处优先检测
         self.last_gaze_position = None  # 上一帧的视线位置
         self.proximity_radius = 128     # 近处搜索半径
+        
+        self.radius_history = deque(maxlen=90)
+        self.expected_gaze_radius = None
+        self.radius_min_samples = 12
+        self.radius_tolerance = 3.0
+        self.fallback_radius = 6
         
         # 圆形质量控制参数
         self.min_circle_fill_ratio = 0.55
@@ -166,6 +172,22 @@ class GazeAnalyzer:
         frame_subset = frame[mask_bool].astype(np.float32)
         frame[mask_bool] = np.clip(frame_subset * (1.0 - alpha) + color_arr * alpha, 0, 255).astype(np.uint8)
 
+    def _update_radius_model(self, radius):
+        """Update running model of gaze radius."""
+        if radius is None or radius <= 0:
+            return
+        self.radius_history.append(float(radius))
+        if len(self.radius_history) >= self.radius_min_samples:
+            self.expected_gaze_radius = float(np.median(self.radius_history))
+
+    def _radius_within_expected(self, radius):
+        if radius is None or radius <= 0:
+            return False
+        if self.expected_gaze_radius is None or len(self.radius_history) < self.radius_min_samples:
+            return True
+        tolerance = max(self.radius_tolerance, self.expected_gaze_radius * 0.25)
+        return abs(radius - self.expected_gaze_radius) <= tolerance
+
     def _estimate_gaze_from_mask(self, gray, mask, left_exclude, right_exclude, top_exclude):
         """Fallback gaze estimation using brightest point inside mask."""
         if mask is None:
@@ -181,7 +203,11 @@ class GazeAnalyzer:
         if max_val < 70:
             return None
         x, y = max_loc
-        radius = 6
+        if self.expected_gaze_radius is not None:
+            radius = int(round(self.expected_gaze_radius))
+        else:
+            radius = self.fallback_radius
+        radius = max(3, min(12, radius))
         return (x, y, radius)
 
 
@@ -291,6 +317,7 @@ class GazeAnalyzer:
 
             if best_circle is not None:
                 self.last_gaze_position = (best_circle[0], best_circle[1])
+                self._update_radius_model(best_circle[2])
                 return best_circle, black_mask
 
         pure_mask = self.create_pure_black_mask(gray)
@@ -302,12 +329,15 @@ class GazeAnalyzer:
         for candidate_mask in fallback_masks:
             fallback_circle = self._estimate_gaze_from_mask(gray, candidate_mask, left_exclude, right_exclude, top_exclude)
             if fallback_circle:
+                if self.expected_gaze_radius is not None and not self._radius_within_expected(fallback_circle[2]):
+                    continue
                 result_mask = black_mask
                 if result_mask is None:
                     result_mask = candidate_mask
                 elif candidate_mask is not None and candidate_mask is not result_mask:
                     result_mask = cv2.bitwise_or(result_mask, candidate_mask)
                 self.last_gaze_position = (fallback_circle[0], fallback_circle[1])
+                self._update_radius_model(fallback_circle[2])
                 return fallback_circle, result_mask
 
         return None, black_mask
@@ -345,6 +375,9 @@ class GazeAnalyzer:
         radius = int(max(2, round(r)))
         if radius <= 1:
             return None
+        if not self._radius_within_expected(radius):
+            if not (context == "black_region" and self.expected_gaze_radius is None):
+                return None
 
         pad = max(radius + 2, int(radius * 1.5))
         x1 = max(0, x - pad)
@@ -443,9 +476,25 @@ class GazeAnalyzer:
 
         ring_gap = ring_mean - inner_mean
 
+
+        coords_binary = np.column_stack(np.where((binary == 255) & (mask == 255)))
+        if coords_binary.size > 0:
+            width_span = np.ptp(coords_binary[:, 1]) + 1
+            height_span = np.ptp(coords_binary[:, 0]) + 1
+            shape_ratio = max(width_span, height_span) / max(1.0, min(width_span, height_span))
+        else:
+            shape_ratio = 1.0
+
+        ultra_bright_ratio = float(np.mean(circle_pixels > 235.0))
         if fill_ratio < min_fill_ratio:
             if not (context == "black_region" and fill_ratio > min_fill_ratio - 0.08 and mean_intensity > 150):
                 return None
+
+        if shape_ratio > 1.8 and fill_ratio < 0.92:
+            return None
+
+        if ultra_bright_ratio > 0.35 and fill_ratio < 0.85:
+            return None
 
         if perimeter_ratio < min_perimeter_ratio:
             return None
@@ -956,6 +1005,8 @@ class GazeAnalyzer:
         # 场景平滑历史
         self.scene_vote_history = deque(maxlen=15)
         self.last_gaze_position = None
+        self.radius_history.clear()
+        self.expected_gaze_radius = None
 
         frame_num = 0
 
