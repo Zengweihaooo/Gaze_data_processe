@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 VR眼动数据自动分析工具 / VR Gaze Data Auto Analysis Tool
 
@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 import os
 import pandas as pd
-from collections import defaultdict, deque, Counter, deque
+from collections import defaultdict
 import argparse
 import json
 import glob
@@ -25,9 +25,13 @@ class GazeAnalyzer:
     def __init__(self):
         # 检测参数
         self.black_threshold = 30  # 黑色阈值（0-255）
-        self.pure_black_threshold = 25  # 纯黑色阈值（0-255）
-        self.side_ui_exclusion_ratio = 0.23  # 侧边UI排除比例
+        self.pure_black_threshold = 15  # pure-black threshold for strict screen region detection
         self.detection_radius = 20  # 视线点周围检测半径
+        self.reality_mask_min_coverage = 0.4  # minimum mask coverage required to consider reality
+        self.reality_black_ratio_threshold = 0.55  # minimum proportion of dark pixels in ROI
+        self.reality_brightness_scale = 0.9  # scale factor for black-threshold brightness check
+        self.manual_tolerance_px = 8  # pixel tolerance when reconciling manual adjustments
+        self.side_ui_exclusion_ratio = 0.12  # portion of frame width to ignore for side UI panels
         self.min_duration = 5  # 最小持续帧数（避免噪声）
         
         # 显示参数
@@ -43,12 +47,6 @@ class GazeAnalyzer:
         self.last_gaze_position = None  # 上一帧的视线位置
         self.proximity_radius = 128     # 近处搜索半径
         
-        self.radius_history = deque(maxlen=90)
-        self.expected_gaze_radius = None
-        self.radius_min_samples = 12
-        self.radius_tolerance = 3.0
-        self.fallback_radius = 6
-        
         # 圆形质量控制参数
         self.min_circle_fill_ratio = 0.55
         self.max_circle_std_ratio = 0.6
@@ -57,24 +55,11 @@ class GazeAnalyzer:
         self.max_color_std_for_circle = 35.0
         self.max_perimeter_radius_std = 0.3
         self.max_eccentricity_ratio = 1.8
-        # 场景判断参数
-        self.scene_dark_ratio_real_min = 0.72
-        self.scene_edge_real_max = 0.04
-        self.scene_color_std_real_max = 12.0
-        self.scene_largest_real_min = 0.55
-        self.scene_edge_virtual_min = 0.08
-        self.scene_sat_virtual_min = 28.0
-        self.scene_color_std_virtual_min = 20.0
-        self.scene_dark_virtual_max = 0.5
-
 
         # 状态稳定控制
         self.transition_hold_frames = 3
         self.pending_state = None
         self.pending_start_frame = 0
-
-        # 场景平滑历史
-        self.scene_vote_history = deque(maxlen=15)
 
     def load_model(self, model_path):
         """Load threshold overrides from a JSON profile"""
@@ -99,14 +84,9 @@ class GazeAnalyzer:
             'max_perimeter_radius_std': 'max_perimeter_radius_std',
             'max_eccentricity_ratio': 'max_eccentricity_ratio',
             'transition_hold_frames': 'transition_hold_frames',
-            'scene_dark_ratio_real_min': 'scene_dark_ratio_real_min',
-            'scene_edge_real_max': 'scene_edge_real_max',
-            'scene_color_std_real_max': 'scene_color_std_real_max',
-            'scene_largest_real_min': 'scene_largest_real_min',
-            'scene_edge_virtual_min': 'scene_edge_virtual_min',
-            'scene_sat_virtual_min': 'scene_sat_virtual_min',
-            'scene_color_std_virtual_min': 'scene_color_std_virtual_min',
-            'scene_dark_virtual_max': 'scene_dark_virtual_max',
+            'reality_mask_min_coverage': 'reality_mask_min_coverage',
+            'reality_black_ratio_threshold': 'reality_black_ratio_threshold',
+            'reality_brightness_scale': 'reality_brightness_scale'
         }
 
         for key, attr in mapping.items():
@@ -114,121 +94,6 @@ class GazeAnalyzer:
                 setattr(self, attr, data[key])
         print(f"[INFO] Loaded gaze model from {model_path}")
 
-
-
-    def _refine_mask(self, mask, kernel_size=5, close_iters=1, open_iters=1):
-        """Apply simple morphology to clean binary masks."""
-        if mask is None:
-            return None
-        kernel = np.ones((kernel_size, kernel_size), np.uint8)
-        if close_iters > 0:
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=close_iters)
-        if open_iters > 0:
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=open_iters)
-        return mask
-
-    def _apply_side_exclusion(self, mask):
-        """Zero-out side UI panels based on configured ratio."""
-        if mask is None:
-            return None
-        h, w = mask.shape[:2]
-        margin = int(round(w * self.side_ui_exclusion_ratio))
-        if margin <= 0:
-            return mask
-        mask = mask.copy()
-        mask[:, :margin] = 0
-        mask[:, w - margin:] = 0
-        return mask
-
-    def _bridge_linear_gaps(self, mask, gap_ratio=0.02, orientation="vertical"):
-        """Fill narrow bright streaks that cut through dark regions."""
-        if mask is None:
-            return None
-        h, w = mask.shape[:2]
-        if orientation == "vertical":
-            kernel_width = max(3, int(w * gap_ratio))
-            if kernel_width % 2 == 0:
-                kernel_width += 1
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, 1))
-        else:
-            kernel_height = max(3, int(h * gap_ratio))
-            if kernel_height % 2 == 0:
-                kernel_height += 1
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_height))
-        return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    def _apply_mask_overlay(self, frame, mask, color=(0, 200, 0), alpha=0.35):
-        """Apply a colored overlay to the provided mask area."""
-        if mask is None:
-            return
-        if len(mask.shape) == 3:
-            mask_2d = mask[:, :, 0]
-        else:
-            mask_2d = mask
-        mask_bool = mask_2d > 0
-        if not np.any(mask_bool):
-            return
-        color_arr = np.array(color, dtype=np.float32)
-        frame_subset = frame[mask_bool].astype(np.float32)
-        frame[mask_bool] = np.clip(frame_subset * (1.0 - alpha) + color_arr * alpha, 0, 255).astype(np.uint8)
-
-    def _update_radius_model(self, radius):
-        """Update running model of gaze radius."""
-        if radius is None or radius <= 0:
-            return
-        self.radius_history.append(float(radius))
-        if len(self.radius_history) >= self.radius_min_samples:
-            self.expected_gaze_radius = float(np.median(self.radius_history))
-
-    def _radius_within_expected(self, radius):
-        if radius is None or radius <= 0:
-            return False
-        if self.expected_gaze_radius is None or len(self.radius_history) < self.radius_min_samples:
-            return True
-        tolerance = max(self.radius_tolerance, self.expected_gaze_radius * 0.25)
-        return abs(radius - self.expected_gaze_radius) <= tolerance
-
-    def _estimate_gaze_from_mask(self, gray, mask, left_exclude, right_exclude, top_exclude):
-        """Fallback gaze estimation using brightest point inside mask."""
-        if mask is None:
-            return None
-        mask_trimmed = mask.copy()
-        mask_trimmed[:top_exclude, :] = 0
-        mask_trimmed[:, :left_exclude] = 0
-        mask_trimmed[:, right_exclude:] = 0
-        if not np.any(mask_trimmed):
-            return None
-        masked_gray = cv2.bitwise_and(gray, gray, mask=mask_trimmed)
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(masked_gray)
-        if max_val < 70:
-            return None
-        x, y = max_loc
-        if self.expected_gaze_radius is not None:
-            radius = int(round(self.expected_gaze_radius))
-        else:
-            radius = self.fallback_radius
-        radius = max(3, min(12, radius))
-        return (x, y, radius)
-
-
-    def create_pure_black_mask(self, gray):
-        """Return a mask of near-zero-intensity pixels (pure black)."""
-        if gray is None:
-            return None
-        if len(gray.shape) == 3:
-            gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        threshold = max(0, min(self.pure_black_threshold, self.black_threshold))
-        mask = cv2.inRange(blurred, 0, threshold)
-        mask = self._refine_mask(mask, kernel_size=3, close_iters=2, open_iters=1)
-        if mask is None:
-            return None
-        if cv2.countNonZero(mask) == 0:
-            return mask
-        mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
-        mask = self._bridge_linear_gaps(mask, gap_ratio=0.015, orientation="vertical")
-        mask = self._apply_side_exclusion(mask)
-        return mask
 
     def detect_gaze_circle(self, frame):
         """Detect bright circular gaze point"""
@@ -282,7 +147,7 @@ class GazeAnalyzer:
             frame_avg_brightness = float(np.mean(gray))
 
             best_circle = None
-            max_score = -float("inf")
+            max_score = -float('inf')
 
             for (x, y, r) in circles:
                 if not (left_exclude <= x <= right_exclude and y >= top_exclude and 0 <= x < w and 0 <= y < h):
@@ -291,12 +156,7 @@ class GazeAnalyzer:
                 if self.is_steering_wheel_button(gray, x, y, r):
                     continue
 
-                if black_mask is not None:
-                    mask_y = min(max(y, 0), black_mask.shape[0] - 1)
-                    mask_x = min(max(x, 0), black_mask.shape[1] - 1)
-                    context = "black_region" if black_mask[mask_y, mask_x] > 0 else "default"
-                else:
-                    context = "default"
+                context = "black_region" if black_mask is not None and black_mask[min(max(y, 0), h - 1), min(max(x, 0), w - 1)] > 0 else "default"
                 metrics = self.evaluate_circle_candidate(frame, gray, x, y, r, context=context)
                 if metrics is None:
                     continue
@@ -317,28 +177,7 @@ class GazeAnalyzer:
 
             if best_circle is not None:
                 self.last_gaze_position = (best_circle[0], best_circle[1])
-                self._update_radius_model(best_circle[2])
                 return best_circle, black_mask
-
-        pure_mask = self.create_pure_black_mask(gray)
-        fallback_masks = []
-        if black_mask is not None:
-            fallback_masks.append(black_mask)
-        if pure_mask is not None:
-            fallback_masks.append(pure_mask)
-        for candidate_mask in fallback_masks:
-            fallback_circle = self._estimate_gaze_from_mask(gray, candidate_mask, left_exclude, right_exclude, top_exclude)
-            if fallback_circle:
-                if self.expected_gaze_radius is not None and not self._radius_within_expected(fallback_circle[2]):
-                    continue
-                result_mask = black_mask
-                if result_mask is None:
-                    result_mask = candidate_mask
-                elif candidate_mask is not None and candidate_mask is not result_mask:
-                    result_mask = cv2.bitwise_or(result_mask, candidate_mask)
-                self.last_gaze_position = (fallback_circle[0], fallback_circle[1])
-                self._update_radius_model(fallback_circle[2])
-                return fallback_circle, result_mask
 
         return None, black_mask
     
@@ -375,9 +214,6 @@ class GazeAnalyzer:
         radius = int(max(2, round(r)))
         if radius <= 1:
             return None
-        if not self._radius_within_expected(radius):
-            if not (context == "black_region" and self.expected_gaze_radius is None):
-                return None
 
         pad = max(radius + 2, int(radius * 1.5))
         x1 = max(0, x - pad)
@@ -448,7 +284,7 @@ class GazeAnalyzer:
         cv2.circle(perimeter_mask, center, radius, 255, 1)
         perimeter_pixels = roi_gray[perimeter_mask == 255].astype(np.float32)
         perimeter_threshold = mean_intensity - (10.0 if context == "black_region" else 12.0)
-        perimeter_ratio = float(np.mean((perimeter_pixels > perimeter_threshold).astype(float))) if perimeter_pixels.size > 0 else 1.0
+        perimeter_ratio = float(np.mean(perimeter_pixels > perimeter_threshold)) if perimeter_pixels.size > 0 else 1.0
 
         perimeter_coords = np.column_stack(np.where(perimeter_mask == 255))
         if perimeter_coords.size > 0:
@@ -476,25 +312,9 @@ class GazeAnalyzer:
 
         ring_gap = ring_mean - inner_mean
 
-
-        coords_binary = np.column_stack(np.where((binary == 255) & (mask == 255)))
-        if coords_binary.size > 0:
-            width_span = np.ptp(coords_binary[:, 1]) + 1
-            height_span = np.ptp(coords_binary[:, 0]) + 1
-            shape_ratio = max(width_span, height_span) / max(1.0, min(width_span, height_span))
-        else:
-            shape_ratio = 1.0
-
-        ultra_bright_ratio = float(np.mean(circle_pixels > 235.0))
         if fill_ratio < min_fill_ratio:
             if not (context == "black_region" and fill_ratio > min_fill_ratio - 0.08 and mean_intensity > 150):
                 return None
-
-        if shape_ratio > 1.8 and fill_ratio < 0.92:
-            return None
-
-        if ultra_bright_ratio > 0.35 and fill_ratio < 0.85:
-            return None
 
         if perimeter_ratio < min_perimeter_ratio:
             return None
@@ -606,9 +426,77 @@ class GazeAnalyzer:
                 return best_circle
 
         return None
-    def create_black_region_mask(self, gray):
-        """Build mask of dark regions"""
+
+    def _refine_mask(self, mask, kernel_size=5, close_iters=1, open_iters=1):
+        """Apply simple morphology to clean binary masks."""
+        if mask is None:
+            return None
+        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        if close_iters > 0:
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=close_iters)
+        if open_iters > 0:
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=open_iters)
+        return mask
+
+    def _apply_side_exclusion(self, mask):
+        """Zero-out side UI panels based on configured ratio."""
+        if mask is None:
+            return None
+        h, w = mask.shape[:2]
+        margin = int(round(w * self.side_ui_exclusion_ratio))
+        if margin <= 0:
+            return mask
+        mask = mask.copy()
+        mask[:, :margin] = 0
+        mask[:, w - margin:] = 0
+        return mask
+
+    def _bridge_linear_gaps(self, mask, gap_ratio=0.02, orientation='vertical'):
+        """Fill narrow bright streaks that cut through dark regions."""
+        if mask is None:
+            return None
+        h, w = mask.shape[:2]
+        if orientation == 'vertical':
+            kernel_width = max(3, int(w * gap_ratio))
+            if kernel_width % 2 == 0:
+                kernel_width += 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, 1))
+        else:
+            kernel_height = max(3, int(h * gap_ratio))
+            if kernel_height % 2 == 0:
+                kernel_height += 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_height))
+        return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    def create_pure_black_mask(self, gray):
+        """Return a mask of near-zero-intensity pixels (pure black)."""
+        if gray is None:
+            return None
+        if len(gray.shape) == 3:
+            gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        threshold = max(0, min(self.pure_black_threshold, self.black_threshold))
+        mask = cv2.inRange(blurred, 0, threshold)
+        mask = self._refine_mask(mask, kernel_size=3, close_iters=2, open_iters=1)
+        if mask is None:
+            return None
+        if cv2.countNonZero(mask) == 0:
+            return mask
+        mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+        mask = self._bridge_linear_gaps(mask, gap_ratio=0.015, orientation='vertical')
+        mask = self._apply_side_exclusion(mask)
+        return mask
+
+    def create_black_region_mask(self, gray):
+        """Build mask of dark regions, prioritising pure-black areas."""
+        if gray is None:
+            return None
+        if len(gray.shape) == 3:
+            gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        area_threshold = max(200, int(gray.shape[0] * gray.shape[1] * 0.001))
+        pure_mask = self.create_pure_black_mask(gray)
+        pure_area = cv2.countNonZero(pure_mask) if pure_mask is not None else 0
 
         adaptive = cv2.adaptiveThreshold(
             blurred,
@@ -619,29 +507,38 @@ class GazeAnalyzer:
             7
         )
         _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        range_mask = cv2.inRange(blurred, 0, min(255, self.black_threshold + 30))
+        range_mask = cv2.inRange(blurred, 0, self.black_threshold)
 
         combined = cv2.bitwise_or(adaptive, otsu)
-        combined = cv2.bitwise_or(combined, range_mask)
+        combined = cv2.bitwise_and(combined, range_mask)
+        combined = self._refine_mask(combined, kernel_size=5, close_iters=2, open_iters=1)
+        combined = self._apply_side_exclusion(combined)
 
-        kernel = np.ones((5, 5), np.uint8)
-        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=2)
-        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel, iterations=1)
-
-        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         mask = np.zeros_like(gray)
-        area_threshold = max(200, int(gray.shape[0] * gray.shape[1] * 0.001))
-
-        found = False
+        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for contour in contours:
-            if cv2.contourArea(contour) >= area_threshold:
-                cv2.fillPoly(mask, [contour], 255)
-                found = True
+            if cv2.contourArea(contour) < area_threshold:
+                continue
+            component_mask = np.zeros_like(gray)
+            cv2.drawContours(component_mask, [contour], -1, 255, -1)
+            mean_intensity = cv2.mean(blurred, mask=component_mask)[0]
+            if mean_intensity <= self.black_threshold:
+                cv2.drawContours(mask, [contour], -1, 255, -1)
 
-        if not found:
+        if pure_area > 0 and pure_mask is not None:
+            mask = cv2.bitwise_or(mask, pure_mask)
+            mask = self._refine_mask(mask, kernel_size=5, close_iters=1, open_iters=1)
+
+        final_area = cv2.countNonZero(mask)
+        if final_area < area_threshold and pure_area >= area_threshold:
+            mask = pure_mask
+        elif final_area == 0:
             mask = combined
 
+        mask = self._bridge_linear_gaps(mask, gap_ratio=0.015, orientation='vertical')
+        mask = self._apply_side_exclusion(mask)
         return mask
+
     def detect_in_black_region(self, frame, gray, black_mask, left_exclude, right_exclude, top_exclude):
         """Detect bright dots inside dark regions"""
         if black_mask is None:
@@ -696,8 +593,8 @@ class GazeAnalyzer:
 
         return best_circle
 
-    def analyze_gaze_region(self, frame, gaze_x, gaze_y, black_mask=None, scene_features=None):
-        """Classify whether the gaze region looks real-world or virtual"""
+    def analyze_gaze_region(self, frame, gaze_x, gaze_y, black_mask=None, pure_mask=None):
+        """Classify gaze region with strict black-mask requirements"""
         h, w = frame.shape[:2]
 
         x1 = max(0, gaze_x - self.detection_radius)
@@ -707,188 +604,87 @@ class GazeAnalyzer:
 
         roi = frame[y1:y2, x1:x2]
         if roi.size == 0:
-            return 'unknown'
+            return 'virtual'
+
+        mask_y = int(np.clip(gaze_y, 0, h - 1))
+        mask_x = int(np.clip(gaze_x, 0, w - 1))
+
+        in_pure = False
+        in_black = False
+        if pure_mask is not None and pure_mask.shape[:2] == (h, w):
+            in_pure = pure_mask[mask_y, mask_x] > 0
+        if black_mask is not None and black_mask.shape[:2] == (h, w):
+            in_black = black_mask[mask_y, mask_x] > 0
+
+        if not (in_pure or in_black):
+            return 'virtual'
 
         gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         avg_brightness = float(np.mean(gray_roi))
-        edge_roi = cv2.Canny(gray_roi, 40, 120)
-        edge_density = float(np.mean((edge_roi > 0).astype(float)))
+        black_pixels = np.sum(gray_roi < self.black_threshold)
+        total_pixels = gray_roi.size
+        black_ratio = (black_pixels / total_pixels) if total_pixels else 0.0
 
-        mask_ratio = 0.0
-        if black_mask is not None:
+        coverage = 0.0
+        if black_mask is not None and black_mask.shape[:2] == (h, w):
             mask_roi = black_mask[y1:y2, x1:x2]
-            if mask_roi.size > 0:
-                mask_ratio = float(np.mean((mask_roi > 0).astype(float)))
+            if mask_roi.size:
+                coverage = max(coverage, float(np.mean(mask_roi > 0)))
+        if pure_mask is not None and pure_mask.shape[:2] == (h, w):
+            pure_roi = pure_mask[y1:y2, x1:x2]
+            if pure_roi.size:
+                coverage = max(coverage, float(np.mean(pure_roi > 0)))
 
-        bottom_dark = scene_features.get('bottom_dark_ratio', 0.0) if scene_features else 0.0
-        bottom_mask = scene_features.get('bottom_mask_ratio', 0.0) if scene_features else 0.0
-        bottom_edge = scene_features.get('bottom_edge_density', 0.0) if scene_features else 0.0
-
-        if bottom_dark > self.scene_dark_ratio_real_min and bottom_mask > 0.5 and bottom_edge < 0.04:
-            if edge_density < 0.06 and avg_brightness < 130:
-                return 'reality'
-
-        if scene_features and scene_features.get('scene_guess') == 'reality' and edge_density < 0.06:
-            return 'reality'
-
-        if edge_density > 0.1 or avg_brightness > 150:
+        if coverage < self.reality_mask_min_coverage:
             return 'virtual'
 
-        if scene_features:
-            return scene_features.get('scene_guess', 'virtual')
+        brightness_threshold = self.black_threshold * self.reality_brightness_scale
+        if black_ratio >= self.reality_black_ratio_threshold or avg_brightness <= brightness_threshold:
+            return 'reality'
+
         return 'virtual'
 
-    def compute_scene_features(self, frame, black_mask=None):
-        """Extract global features for scene classification"""
-        h, w = frame.shape[:2]
-        features = {}
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        edges_full = cv2.Canny(gray, 60, 160)
-        features['edge_density_full'] = float(np.mean((edges_full > 0).astype(float)))
-
-        dark_mask = gray < 45
-        features['dark_ratio_full'] = float(np.mean(dark_mask.astype(float)))
-
-        top_h = int(h * 0.55)
-        top_roi = frame[:top_h, :]
-        gray_top = gray[:top_h, :]
-        edges_top = edges_full[:top_h, :]
-        hsv_top = cv2.cvtColor(top_roi, cv2.COLOR_BGR2HSV)
-
-        features['edge_density_top'] = float(np.mean((edges_top > 0).astype(float)))
-        features['dark_ratio_top'] = float(np.mean((gray_top < 45).astype(float)))
-        features['sat_mean_top'] = float(np.mean(hsv_top[:, :, 1]))
-        features['color_std_top'] = float(np.mean(np.std(top_roi.reshape(-1, 3), axis=0)))
-
-        bottom_roi = frame[top_h:, :]
-        gray_bottom = gray[top_h:, :]
-        edges_bottom = edges_full[top_h:, :]
-        features['bottom_dark_ratio'] = float(np.mean((gray_bottom < 45).astype(float)))
-        features['bottom_edge_density'] = float(np.mean((edges_bottom > 0).astype(float)))
-
-        if black_mask is not None:
-            mask_bool = black_mask > 0
-            features['mask_ratio_full'] = float(np.mean(mask_bool.astype(float)))
-            contours, _ = cv2.findContours(black_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if contours:
-                areas = [cv2.contourArea(c) for c in contours]
-                features['largest_region_ratio'] = float(max(areas)) / float(h * w)
-            else:
-                features['largest_region_ratio'] = 0.0
-            bottom_mask = black_mask[top_h:, :]
-            features['bottom_mask_ratio'] = float(np.mean((bottom_mask > 0).astype(float)))
-        else:
-            features['mask_ratio_full'] = 0.0
-            features['largest_region_ratio'] = 0.0
-            features['bottom_mask_ratio'] = 0.0
-
-        features['scene_guess'] = self.estimate_scene_state(features)
-        return features
-
-    def estimate_scene_state(self, features, default='virtual'):
-        """Guess overall scene using extracted features"""
-        if not features:
-            return default
-
-        dark_top = features.get('dark_ratio_top', 0.0)
-        edge_top = features.get('edge_density_top', 0.0)
-        color_std = features.get('color_std_top', 0.0)
-        sat_top = features.get('sat_mean_top', 0.0)
-        largest = features.get('largest_region_ratio', 0.0)
-        bottom_dark = features.get('bottom_dark_ratio', 0.0)
-        bottom_edge = features.get('bottom_edge_density', 0.0)
-        bottom_mask = features.get('bottom_mask_ratio', 0.0)
-
-        if bottom_dark > self.scene_dark_ratio_real_min and bottom_mask > 0.55 and bottom_edge < 0.04:
-            return 'reality'
-        if dark_top > self.scene_dark_ratio_real_min and edge_top < self.scene_edge_real_max and color_std < self.scene_color_std_real_max and bottom_edge < 0.05:
-            return 'reality'
-        if largest > self.scene_largest_real_min and edge_top < self.scene_edge_real_max and color_std < self.scene_color_std_real_max:
-            return 'reality'
-
-        if edge_top > self.scene_edge_virtual_min or sat_top > self.scene_sat_virtual_min or color_std > self.scene_color_std_virtual_min:
-            return 'virtual'
-        if bottom_dark < self.scene_dark_virtual_max or bottom_edge > 0.08:
-            return 'virtual'
-
-        return default
-
-    def update_scene_history(self, scene_guess):
-        """Update scene vote history for smoothing"""
-        self.scene_vote_history.append(scene_guess)
-        if len(self.scene_vote_history) < 3:
-            return scene_guess
-        
-        # Use majority vote from recent history
-        recent_votes = list(self.scene_vote_history)[-5:]  # Last 5 votes
-        reality_count = recent_votes.count('reality')
-        virtual_count = recent_votes.count('virtual')
-        
-        if reality_count > virtual_count:
-            return 'reality'
-        elif virtual_count > reality_count:
-            return 'virtual'
-        else:
-            return scene_guess
-
     def draw_indicator(self, frame, state):
-        """Draw state indicator on frame"""
-        h, w = frame.shape[:2]
+        """在左上角绘制状态指示器"""
+        x, y = self.indicator_pos
+        w, h = self.indicator_size
         
-        # Draw background rectangle
-        indicator_w = 200
-        indicator_h = 60
-        x = w - indicator_w - 20
-        y = 20
-        
-        # Color based on state
+        # 选择颜色
         if state == 'reality':
-            color = (0, 255, 0)  # Green
-            text = "REALITY"
+            color = (0, 255, 0)  # 绿色
+            text = 'REALITY'
         elif state == 'virtual':
-            color = (0, 0, 255)  # Red
-            text = "VIRTUAL"
+            color = (0, 0, 255)  # 红色
+            text = 'VIRTUAL'
         else:
-            color = (128, 128, 128)  # Gray
-            text = "UNKNOWN"
+            color = (128, 128, 128)  # 灰色
+            text = 'UNKNOWN'
         
-        # Draw background
-        cv2.rectangle(frame, (x, y), (x + indicator_w, y + indicator_h), (0, 0, 0), -1)
-        cv2.rectangle(frame, (x, y), (x + indicator_w, y + indicator_h), color, 2)
+        # 绘制矩形指示器
+        cv2.rectangle(frame, (x, y), (x + w, y + h), color, -1)
         
-        # Draw text
+        # 添加文字
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.8
-        thickness = 2
-        text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
-        text_x = x + (indicator_w - text_size[0]) // 2
-        text_y = y + (indicator_h + text_size[1]) // 2
-        cv2.putText(frame, text, (text_x, text_y), font, font_scale, color, thickness)
-
-    def apply_reality_overlay(self, frame, black_mask, state):
-        """Apply reality overlay effect to frame"""
-        if state == 'reality' and black_mask is not None:
-            # Apply subtle green tint to reality regions
-            overlay = frame.copy()
-            overlay[black_mask > 0] = [0, 255, 0]  # Green tint
-            cv2.addWeighted(frame, 0.9, overlay, 0.1, 0, frame)
-
-    def draw_mask_indicator(self, frame, source_frame, black_mask, scene_features=None):
-        """Render frame/mask comparison thumbnail with stats"""
-        if black_mask is None:
-            return
-
+        text_size = cv2.getTextSize(text, font, 0.6, 2)[0]
+        text_x = x + (w - text_size[0]) // 2
+        text_y = y + (h + text_size[1]) // 2
+        cv2.putText(frame, text, (text_x, text_y), font, 0.6, (255, 255, 255), 2)
+    def draw_mask_indicator(self, frame, source_frame, black_mask):
+        """Render frame/mask comparison thumbnail"""
         h, w = frame.shape[:2]
 
-        thumb_w = max(80, min(160, w // 8))
-        thumb_h = max(60, min(120, int(thumb_w * 0.75)))
+        thumb_w = max(60, min(120, w // 10))
+        thumb_h = max(45, min(90, int(thumb_w * 0.75)))
 
         mask_resized = cv2.resize(black_mask, (thumb_w, thumb_h))
         frame_resized = cv2.resize(source_frame, (thumb_w, thumb_h))
 
-        mask_overlay = cv2.merge([np.zeros_like(mask_resized), mask_resized, np.zeros_like(mask_resized)])
-        overlay = cv2.addWeighted(frame_resized, 0.55, mask_overlay, 0.45, 0)
+        mask_overlay = cv2.merge([
+            np.zeros_like(mask_resized),
+            mask_resized,
+            np.zeros_like(mask_resized)
+        ])
+        overlay = cv2.addWeighted(frame_resized, 0.65, mask_overlay, 0.35, 0)
         mask_colored = cv2.cvtColor(mask_resized, cv2.COLOR_GRAY2BGR)
 
         combined = np.hstack([frame_resized, overlay, mask_colored])
@@ -907,21 +703,6 @@ class GazeAnalyzer:
         cv2.rectangle(frame, (thumb_x, thumb_y), (thumb_x + total_w, thumb_y + thumb_h), (255, 255, 255), 1)
         font = cv2.FONT_HERSHEY_SIMPLEX
         cv2.putText(frame, 'Frame | Overlay | Mask', (thumb_x, thumb_y - 5), font, 0.4, (255, 255, 255), 1)
-
-        if scene_features:
-            dark_top = scene_features.get('dark_ratio_top', 0.0)
-            edge_top = scene_features.get('edge_density_top', 0.0)
-            bottom_dark = scene_features.get('bottom_dark_ratio', 0.0)
-            bottom_mask = scene_features.get('bottom_mask_ratio', 0.0)
-            sat_top = scene_features.get('sat_mean_top', 0.0)
-            largest = scene_features.get('largest_region_ratio', 0.0)
-            guess = scene_features.get('scene_guess', 'n/a').upper()
-            label1 = f"DarkTop:{dark_top:.2f} EdgeTop:{edge_top:.2f}"
-            label2 = f"BottomDark:{bottom_dark:.2f} BottomMask:{bottom_mask:.2f}"
-            label3 = f"Largest:{largest:.2f} SatTop:{sat_top:.1f} Scene:{guess}"
-            cv2.putText(frame, label1, (thumb_x + 5, thumb_y + thumb_h - 33), font, 0.42, (200, 255, 200), 1)
-            cv2.putText(frame, label2, (thumb_x + 5, thumb_y + thumb_h - 17), font, 0.42, (200, 255, 200), 1)
-            cv2.putText(frame, label3, (thumb_x + 5, thumb_y + thumb_h - 1), font, 0.42, (200, 255, 200), 1)
     def update_state(self, raw_state, frame_num, fps):
         """Update stable state with hysteresis"""
         if raw_state == 'unknown':
@@ -983,7 +764,7 @@ class GazeAnalyzer:
 
     def analyze_video(self, video_path, output_dir=None, show_preview=True):
         """Analyze a single video"""
-        print(f"[INFO] 开始分析: {os.path.basename(video_path)}")
+        print(f"🎬 开始分析: {os.path.basename(video_path)}")
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -995,18 +776,13 @@ class GazeAnalyzer:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        print(f"[INFO] 视频信息: {width}x{height}, {fps:.2f}fps, {total_frames}帧")
+        print(f"📊 视频信息: {width}x{height}, {fps:.2f}fps, {total_frames}帧")
 
         self.segments = []
         self.current_state = None
         self.pending_state = None
         self.pending_start_frame = 0
-
-        # 场景平滑历史
-        self.scene_vote_history = deque(maxlen=15)
         self.last_gaze_position = None
-        self.radius_history.clear()
-        self.expected_gaze_radius = None
 
         frame_num = 0
 
@@ -1024,39 +800,37 @@ class GazeAnalyzer:
                     break
                 raw_frame_for_mask = frame.copy()
                 gray_frame = cv2.cvtColor(raw_frame_for_mask, cv2.COLOR_BGR2GRAY)
-
-                gaze_circle, black_mask = self.detect_gaze_circle(frame)
                 pure_black_mask = self.create_pure_black_mask(gray_frame)
-                overlay_mask = None
-                if pure_black_mask is not None and cv2.countNonZero(pure_black_mask) > 0:
-                    overlay_mask = pure_black_mask
-                elif black_mask is not None:
-                    overlay_mask = black_mask
 
-                scene_features = self.compute_scene_features(frame, overlay_mask)
-                scene_guess = scene_features.get('scene_guess', 'virtual')
-                scene_guess = self.update_scene_history(scene_guess)
-                scene_features['scene_guess'] = scene_guess
+                detection_result = self.detect_gaze_circle(frame)
+
+                raw_state = 'virtual'
+                gaze_circle = None
+                black_mask = None
+
+                if detection_result and len(detection_result) == 2:
+                    gaze_circle, black_mask = detection_result
 
                 if gaze_circle:
                     gaze_x, gaze_y, radius = gaze_circle
-                    raw_state = self.analyze_gaze_region(frame, gaze_x, gaze_y, black_mask, scene_features)
+                    raw_state = self.analyze_gaze_region(
+                        frame,
+                        gaze_x,
+                        gaze_y,
+                        black_mask=black_mask,
+                        pure_mask=pure_black_mask
+                    )
                     cv2.circle(frame, (gaze_x, gaze_y), radius, (255, 255, 0), 2)
                     cv2.circle(frame, (gaze_x, gaze_y), self.detection_radius, (0, 255, 255), 1)
-                else:
-                    raw_state = scene_guess
 
                 self.update_state(raw_state, frame_num, fps)
-                if overlay_mask is not None:
-                    self._apply_mask_overlay(frame, overlay_mask)
-
                 stable_state = self.current_state if self.current_state is not None else raw_state
 
-                self.apply_reality_overlay(frame, overlay_mask, stable_state)
                 self.draw_indicator(frame, stable_state)
 
-                if overlay_mask is not None:
-                    self.draw_mask_indicator(frame, raw_frame_for_mask, overlay_mask, scene_features)
+                mask_for_overlay = black_mask if black_mask is not None else pure_black_mask
+                if mask_for_overlay is not None:
+                    self.draw_mask_indicator(frame, raw_frame_for_mask, mask_for_overlay)
 
                 if frame_num % 100 == 0 and total_frames > 0:
                     progress = (frame_num / total_frames) * 100
@@ -1071,13 +845,10 @@ class GazeAnalyzer:
                         scale = 1280 / width
                         display_frame = cv2.resize(frame, (int(width * scale), int(height * scale)))
 
-                    try:
-                        cv2.imshow('Gaze Analysis', display_frame)
-                        if cv2.waitKey(1) & 0xFF == 27:
-                            print("⏹️  用户中断预览")
-                            break
-                    except Exception as e:
-                        print(f"[WARN] 预览显示错误: {e}")
+                    cv2.imshow('Gaze Analysis', display_frame)
+
+                    if cv2.waitKey(1) & 0xFF == 27:
+                        print("⏹️  用户中断预览")
                         break
 
                 frame_num += 1
@@ -1087,10 +858,7 @@ class GazeAnalyzer:
             if output_video:
                 output_video.release()
             if show_preview:
-                try:
-                    cv2.destroyAllWindows()
-                except Exception as e:
-                    print(f"[WARN] 关闭窗口错误: {e}")
+                cv2.destroyAllWindows()
 
         self.finalize_segments(frame_num, fps)
 
@@ -1099,6 +867,7 @@ class GazeAnalyzer:
         self.generate_report(video_path, output_dir)
 
         return self.segments
+    
     def generate_report(self, video_path, output_dir):
         """生成分析报告"""
         if not self.segments:
@@ -1113,7 +882,7 @@ class GazeAnalyzer:
         virtual_duration = sum(s['duration_seconds'] for s in virtual_segments)
         total_duration = reality_duration + virtual_duration
         
-        print(f"\n[INFO] 分析报告:")
+        print(f"\n📊 分析报告:")
         print(f"=" * 50)
         print(f"现实世界片段: {len(reality_segments)} 个, 总时长: {reality_duration:.2f}秒")
         print(f"虚拟世界片段: {len(virtual_segments)} 个, 总时长: {virtual_duration:.2f}秒")
@@ -1145,7 +914,7 @@ class GazeAnalyzer:
             csv_path = os.path.join(output_dir, f"{base_name}_analysis.csv")
             df.to_csv(csv_path, index=False, encoding='utf-8-sig')
             
-            print(f"[INFO] 详细数据已保存: {csv_path}")
+            print(f"📄 详细数据已保存: {csv_path}")
 
 def get_video_files(directory):
     """获取目录下的视频文件"""
@@ -1168,7 +937,7 @@ def main():
 
     args = parser.parse_args()
 
-    print("[INFO] VR眼动数据自动分析工具")
+    print("🎯 VR眼动数据自动分析工具")
     print("=" * 50)
 
     if not os.path.exists(args.input):
@@ -1180,7 +949,7 @@ def main():
         print(f"[WARN] {args.input} 中没有找到视频文件")
         return
 
-    print(f"[INFO] 找到 {len(video_files)} 个视频文件")
+    print(f"📁 找到 {len(video_files)} 个视频文件")
 
     analyzer = GazeAnalyzer()
     analyzer.black_threshold = args.black_threshold
@@ -1207,7 +976,7 @@ def main():
                 return
 
         for video_file in selected_files:
-            print(f"\n[INFO] 开始分析 {os.path.basename(video_file)}")
+            print(f"\n🚀 开始分析 {os.path.basename(video_file)}")
             segments = analyzer.analyze_video(
                 video_file,
                 args.output,
